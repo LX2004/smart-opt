@@ -50,7 +50,7 @@ class Configs:
 
 @dataclass
 class DDPGConfig:
-    episodes: int = 200
+    episodes: int = 120
     batch_size: int = 256
     buffer_size: int = 200000
     gamma: float = 0.99
@@ -975,6 +975,77 @@ def save_reward_components_csv(save_dir, split_name, records):
     return path
 
 
+EPISODE_REWARD_SUM_KEYS = [
+    "reward",
+    "step_cost",
+    "curtail_cost",
+    "comfort_cost_weighted",
+    "h2_tank_violation_cost",
+    "carbon_cost",
+    "bio_starvation_cost",
+    "biomass_reward_component",
+    "harvest_reward_component",
+    "grid_purchase_mwh",
+    "grid_co2_emission_t",
+    "bio_co2_absorption_t",
+    "net_co2_emission_t",
+    "h2_tank_violation_mol",
+    "battery_charge_mw",
+    "battery_discharge_mw",
+]
+
+def summarize_epoch_reward_components(episode, split_name, total_reward, records):
+    if not records:
+        raise ValueError("Cannot summarize an empty episode record list.")
+
+    row = {
+        "epoch": int(episode),
+        "episode": int(episode),
+        "split": split_name,
+        "total_reward": float(total_reward),
+        "mean_reward": float(total_reward) / max(len(records), 1),
+        "hours": int(len(records)),
+    }
+    for key in EPISODE_REWARD_SUM_KEYS:
+        values = np.asarray([record[key] for record in records], dtype=np.float64)
+        row[f"{key}_sum"] = float(np.sum(values))
+        row[f"{key}_mean"] = float(np.mean(values))
+
+    last_record = records[-1]
+    row["final_h2_tank_mol"] = float(last_record["h2_tank_mol"])
+    row["final_battery_soc_mwh"] = float(last_record["battery_soc_mwh"])
+    row["final_battery_soc_fraction"] = float(last_record["battery_soc_fraction"])
+    row["mean_bio_H2_growth_fraction"] = float(np.mean([r["bio_H2_growth_fraction"] for r in records]))
+    row["mean_bio_starvation_level"] = float(np.mean([r["bio_starvation_level"] for r in records]))
+    row["mean_p_ez_mw"] = float(np.mean([r["p_ez_mw"] for r in records]))
+    row["mean_grid_purchase_mwh"] = float(np.mean([r["grid_purchase_mwh"] for r in records]))
+    return row
+
+
+def write_epoch_reward_history_csv(save_dir, split_name, rows):
+    if not rows:
+        return None
+    path = os.path.join(save_dir, f"epoch_reward_components_{split_name}.csv")
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def write_combined_epoch_reward_history_csv(save_dir, rows):
+    if not rows:
+        return None
+    path = os.path.join(save_dir, "epoch_reward_components_all.csv")
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
 def save_split_results(save_dir, split_name, scenario, records, reward, episode_rewards=None):
     result = records_to_arrays(records)
     if split_name in {"train", "test"}:
@@ -1083,6 +1154,9 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
     replay_buffer = ReplayBuffer(ddpg_cfg.buffer_size, env.state_dim, env.action_dim, device)
 
     episode_rewards = []
+    epoch_train_reward_rows = []
+    epoch_test_reward_rows = []
+    epoch_all_reward_rows = []
     noise_std = ddpg_cfg.exploration_noise
     best_reward = -np.inf
     best_records = None
@@ -1101,6 +1175,21 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
                 agent.learn(replay_buffer)
 
         episode_rewards.append(total_reward)
+        train_episode_records = list(env.records)
+        train_epoch_row = summarize_epoch_reward_components(
+            episode, "train", total_reward, train_episode_records
+        )
+        test_epoch_reward, test_epoch_records = evaluate_policy(test_env, agent)
+        test_epoch_row = summarize_epoch_reward_components(
+            episode, "test", test_epoch_reward, test_epoch_records
+        )
+        epoch_train_reward_rows.append(train_epoch_row)
+        epoch_test_reward_rows.append(test_epoch_row)
+        epoch_all_reward_rows.extend([train_epoch_row, test_epoch_row])
+        write_epoch_reward_history_csv(save_dir, "train", epoch_train_reward_rows)
+        write_epoch_reward_history_csv(save_dir, "test", epoch_test_reward_rows)
+        write_combined_epoch_reward_history_csv(save_dir, epoch_all_reward_rows)
+
         noise_std = max(ddpg_cfg.min_noise, noise_std * ddpg_cfg.noise_decay)
         validation_reward, validation_records = evaluate_policy(validation_env, agent)
         if validation_reward > best_reward:
@@ -1111,6 +1200,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
         if episode == 1 or episode % 10 == 0:
             print(
                 f"Episode {episode:04d} | train_reward={total_reward:.3f} "
+                f"| test_reward={test_epoch_reward:.3f} "
                 f"| validation_reward={validation_reward:.3f} | noise={noise_std:.3f}"
             )
 
@@ -1142,6 +1232,12 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
         validation_reward=np.asarray([validation_reward], dtype=np.float32),
         test_reward=np.asarray([test_reward], dtype=np.float32),
         episode_rewards=np.asarray(episode_rewards, dtype=np.float32),
+        epoch_train_rewards=np.asarray(
+            [row["total_reward"] for row in epoch_train_reward_rows], dtype=np.float32
+        ),
+        epoch_test_rewards=np.asarray(
+            [row["total_reward"] for row in epoch_test_reward_rows], dtype=np.float32
+        ),
         **{key: np.asarray([value], dtype=np.float32) for key, value in energy_summary.items()},
     )
     return {"train": train_result, "validation": validation_result, "test": test_result}, episode_rewards
@@ -1150,7 +1246,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Solve the microgrid plus HOB-SCP bio-load scenario with DDPG.")
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--seed", type=int, default=8)
-    parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "DDPG_results"))
+    parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "DDPG_result"))
     return parser.parse_args()
 
 
