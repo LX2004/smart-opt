@@ -88,6 +88,8 @@ class HOBLoadConfig:
     auto_replace: bool = True
     restart_immediately_after_replacement: bool = True
     reset_on_shutdown: bool = True
+    physical_h2_feed_max_mol_h: float = float("inf")
+    enforce_h2_survival_min: bool = True
 
 
 class HOBHydrogenLoad:
@@ -136,6 +138,9 @@ class HOBHydrogenLoad:
 
         if self.config.min_runtime_before_replacement_h < 0:
             raise ValueError("min_runtime_before_replacement_h must be non-negative")
+
+        if self.config.physical_h2_feed_max_mol_h <= 0:
+            raise ValueError("physical_h2_feed_max_mol_h must be > 0")
 
         self.X0_gdw = float(X0_gdw)
         self.initial_scp_g = self.params.f_protein * self.X0_gdw
@@ -240,10 +245,69 @@ class HOBHydrogenLoad:
 
         return harvested_scp_g
 
+    def minimum_survival_h2_mol_h(self, X_gdw: Optional[float] = None) -> float:
+        if not self.active and X_gdw is None:
+            return 0.0
+        biomass = self.X_gdw if X_gdw is None else float(X_gdw)
+        return max(0.0, biomass * self.params.m_h2 / 1000.0)
+
+    def biological_h2_absorption_max_mol_h(self, X_gdw: Optional[float] = None) -> float:
+        if not self.active and X_gdw is None:
+            return 0.0
+        biomass = self.X_gdw if X_gdw is None else float(X_gdw)
+        return max(0.0, biomass * self.params.q_h2_hydrogenase_cap / 1000.0)
+
+    def physical_h2_feed_max_mol_h(self) -> float:
+        return float(self.config.physical_h2_feed_max_mol_h)
+
+    def h2_feed_bounds(
+        self,
+        available_h2_mol_h: Optional[float] = None,
+        X_gdw: Optional[float] = None,
+    ) -> Dict[str, float]:
+        survival_min = self.minimum_survival_h2_mol_h(X_gdw=X_gdw)
+        biological_max = self.biological_h2_absorption_max_mol_h(X_gdw=X_gdw)
+        physical_max = self.physical_h2_feed_max_mol_h()
+        external_available = float("inf") if available_h2_mol_h is None else max(0.0, float(available_h2_mol_h))
+        feasible_max = min(biological_max, physical_max, external_available)
+        feasible_min = survival_min if feasible_max >= survival_min else feasible_max
+        return {
+            "H2_survival_min_mol_h": float(survival_min),
+            "H2_biological_absorption_max_mol_h": float(biological_max),
+            "H2_physical_supply_max_mol_h": float(physical_max),
+            "H2_external_available_mol_h": float(external_available),
+            "H2_feasible_min_mol_h": float(feasible_min),
+            "H2_feasible_max_mol_h": float(feasible_max),
+        }
+
+    def resolve_h2_feed_mol_h(
+        self,
+        requested_h2_mol_h: float,
+        available_h2_mol_h: Optional[float] = None,
+        enforce_survival_min: Optional[bool] = None,
+        X_gdw: Optional[float] = None,
+    ) -> Dict[str, float]:
+        requested = max(0.0, float(requested_h2_mol_h))
+        enforce = self.config.enforce_h2_survival_min if enforce_survival_min is None else bool(enforce_survival_min)
+        bounds = self.h2_feed_bounds(available_h2_mol_h=available_h2_mol_h, X_gdw=X_gdw)
+        lower = bounds["H2_feasible_min_mol_h"] if enforce else 0.0
+        upper = bounds["H2_feasible_max_mol_h"]
+        actual = float(np.clip(requested, lower, upper))
+        result = {
+            "H2_requested_mol_h": requested,
+            "H2_actual_feed_mol_h": actual,
+            "H2_feed_raised_to_survival": bool(actual > requested + 1e-12),
+            "H2_feed_limited_by_upper": bool(actual < requested - 1e-12),
+            "H2_survival_shortfall_mol_h": max(0.0, bounds["H2_survival_min_mol_h"] - actual),
+        }
+        result.update(bounds)
+        return result
+
     def state(self) -> Dict[str, float]:
         """
         Return current state for optimization or reinforcement learning.
         """
+        bounds = self.h2_feed_bounds()
         return {
             "active": float(self.active),
             "cycle_id": float(self.cycle_id),
@@ -253,6 +317,7 @@ class HOBHydrogenLoad:
             "last_H2_maintenance_fraction": self.last_maintenance_fraction,
             "last_H2_growth_fraction": self.last_growth_fraction,
             "cumulative_harvested_SCP_g_protein": self.cumulative_harvested_scp_g,
+            **bounds,
         }
 
     def _off_record(
@@ -267,10 +332,14 @@ class HOBHydrogenLoad:
         restart_event: bool = False,
         harvested_scp_g: float = 0.0,
         reason: str = "off",
+        h2_limit_info: Optional[Dict[str, float]] = None,
     ) -> Dict[str, object]:
         """
         Create a standard zero-consumption record when the load is off.
         """
+        h2_limit_info = h2_limit_info or self.resolve_h2_feed_mol_h(
+            F_H2_mol_h, enforce_survival_min=False
+        )
         return {
             "time_h": time_h,
             "dt_h": dt_h,
@@ -294,7 +363,18 @@ class HOBHydrogenLoad:
             "limiting_factor": reason,
             "starvation_level": 0.0,
 
+            "H2_requested_mol_h": float(h2_limit_info["H2_requested_mol_h"]),
             "H2_input_mol_h": float(F_H2_mol_h),
+            "H2_actual_feed_mol_h": float(F_H2_mol_h),
+            "H2_survival_min_mol_h": float(h2_limit_info["H2_survival_min_mol_h"]),
+            "H2_biological_absorption_max_mol_h": float(h2_limit_info["H2_biological_absorption_max_mol_h"]),
+            "H2_physical_supply_max_mol_h": float(h2_limit_info["H2_physical_supply_max_mol_h"]),
+            "H2_external_available_mol_h": float(h2_limit_info["H2_external_available_mol_h"]),
+            "H2_feasible_min_mol_h": float(h2_limit_info["H2_feasible_min_mol_h"]),
+            "H2_feasible_max_mol_h": float(h2_limit_info["H2_feasible_max_mol_h"]),
+            "H2_feed_raised_to_survival": bool(h2_limit_info["H2_feed_raised_to_survival"]),
+            "H2_feed_limited_by_upper": bool(h2_limit_info["H2_feed_limited_by_upper"]),
+            "H2_survival_shortfall_mol_h": float(h2_limit_info["H2_survival_shortfall_mol_h"]),
             "O2_input_mol_h": float(F_O2_mol_h),
             "CO2_input_mol_h": float(F_CO2_mol_h),
 
@@ -353,6 +433,8 @@ class HOBHydrogenLoad:
         load_on: bool = True,
         force_replace: bool = False,
         time_h: Optional[float] = None,
+        available_H2_mol_h: Optional[float] = None,
+        enforce_H2_survival_min: Optional[bool] = None,
     ) -> Dict[str, object]:
         """
         Run one dispatch step.
@@ -437,6 +519,14 @@ class HOBHydrogenLoad:
         X_before = float(self.X_gdw)
         SCP_before = float(self.SCP_g_protein)
         age_before = float(self.age_h)
+
+        h2_limit_info = self.resolve_h2_feed_mol_h(
+            F_H2_mol_h,
+            available_h2_mol_h=available_H2_mol_h,
+            enforce_survival_min=enforce_H2_survival_min,
+            X_gdw=X_before,
+        )
+        F_H2_mol_h = h2_limit_info["H2_actual_feed_mol_h"]
 
         # ------------------------------------------------------------
         # 1. Gas input per unit biomass
@@ -615,7 +705,18 @@ class HOBHydrogenLoad:
             "starvation_level": starvation,
 
             # Gas input
+            "H2_requested_mol_h": float(h2_limit_info["H2_requested_mol_h"]),
             "H2_input_mol_h": float(F_H2_mol_h),
+            "H2_actual_feed_mol_h": float(F_H2_mol_h),
+            "H2_survival_min_mol_h": float(h2_limit_info["H2_survival_min_mol_h"]),
+            "H2_biological_absorption_max_mol_h": float(h2_limit_info["H2_biological_absorption_max_mol_h"]),
+            "H2_physical_supply_max_mol_h": float(h2_limit_info["H2_physical_supply_max_mol_h"]),
+            "H2_external_available_mol_h": float(h2_limit_info["H2_external_available_mol_h"]),
+            "H2_feasible_min_mol_h": float(h2_limit_info["H2_feasible_min_mol_h"]),
+            "H2_feasible_max_mol_h": float(h2_limit_info["H2_feasible_max_mol_h"]),
+            "H2_feed_raised_to_survival": bool(h2_limit_info["H2_feed_raised_to_survival"]),
+            "H2_feed_limited_by_upper": bool(h2_limit_info["H2_feed_limited_by_upper"]),
+            "H2_survival_shortfall_mol_h": float(h2_limit_info["H2_survival_shortfall_mol_h"]),
             "O2_input_mol_h": float(F_O2_mol_h),
             "CO2_input_mol_h": float(F_CO2_mol_h),
 
@@ -677,7 +778,7 @@ class HOBHydrogenLoad:
         F_H2_mol_h: NumberOrArray,
         F_O2_mol_h: NumberOrArray,
         F_CO2_mol_h: NumberOrArray,
-        hours: float = 240.0,
+        hours: float = 96.0,
         dt_h: float = 1.0,
         load_on_profile: Optional[NumberOrArray] = None,
         force_replace_profile: Optional[NumberOrArray] = None,
@@ -748,6 +849,206 @@ class HOBHydrogenLoad:
             rows.append(row)
 
         return pd.DataFrame(rows)
+
+
+    def simulate_at_h2_capacity(
+        self,
+        hours: float = 96.0,
+        dt_h: float = 1.0,
+        o2_per_h2_ratio: float = 0.40,
+        co2_per_h2_ratio: float = 0.125,
+        clear_records: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Simulate operation when H2 is continuously supplied at the smaller of
+        the physical supply limit and current biological H2 absorption limit.
+
+        At each step:
+            F_H2 = min(physical_h2_feed_max_mol_h,
+                       biological_h2_absorption_max_mol_h(current X_gDW))
+
+        O2 and CO2 feed rates are scaled from the selected H2 feed rate. The
+        returned dataframe includes cumulative CO2 uptake and SCP growth columns
+        for plotting and downstream analysis.
+        """
+        if hours <= 0:
+            raise ValueError("hours must be > 0")
+        if dt_h <= 0:
+            raise ValueError("dt_h must be > 0")
+        if o2_per_h2_ratio < 0 or co2_per_h2_ratio < 0:
+            raise ValueError("Gas feed ratios must be non-negative")
+
+        physical_max = self.physical_h2_feed_max_mol_h()
+        if not np.isfinite(physical_max):
+            raise ValueError(
+                "physical_h2_feed_max_mol_h must be finite for capacity simulation"
+            )
+
+        if clear_records:
+            self.records = []
+
+        n = int(np.ceil(hours / dt_h))
+        rows = []
+        for i in range(n):
+            h2_feed_mol_h = min(
+                self.physical_h2_feed_max_mol_h(),
+                self.biological_h2_absorption_max_mol_h(),
+            )
+            row = self.step(
+                F_H2_mol_h=h2_feed_mol_h,
+                F_O2_mol_h=h2_feed_mol_h * o2_per_h2_ratio,
+                F_CO2_mol_h=h2_feed_mol_h * co2_per_h2_ratio,
+                dt_h=dt_h,
+                load_on=True,
+                force_replace=False,
+                time_h=(i + 1) * dt_h,
+                available_H2_mol_h=h2_feed_mol_h,
+                enforce_H2_survival_min=True,
+            )
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df["CO2_uptake_mol_h"] = df["CO2_uptake_mol"] / df["dt_h"]
+            df["cumulative_CO2_uptake_mol"] = df["CO2_uptake_mol"].cumsum()
+            df["cumulative_CO2_uptake_kg"] = (
+                df["cumulative_CO2_uptake_mol"] * 44.0095 / 1000.0
+            )
+            df["SCP_growth_rate_g_protein_h"] = df["dSCP_g_protein"] / df["dt_h"]
+            df["H2_to_SCP_growth_ratio_mol_per_g"] = np.where(
+                df["dSCP_g_protein"] > 1e-12,
+                df["H2_input_mol_h"] * df["dt_h"] / df["dSCP_g_protein"],
+                np.nan,
+            )
+            df["cumulative_SCP_growth_g_protein"] = df["dSCP_g_protein"].cumsum()
+            df["total_SCP_available_g_protein"] = (
+                df["SCP_g_protein_after_event"]
+                + df["cumulative_harvested_SCP_g_protein"]
+            )
+        return df
+
+    def plot_capacity_co2_scp(
+        self,
+        df: Optional[pd.DataFrame] = None,
+        figure_dir: str = "figure",
+        filename: str = "hob_capacity_co2_scp.png",
+    ) -> str:
+        """
+        Plot CO2 uptake and SCP growth for capacity-limited H2 operation.
+        """
+        if df is None:
+            df = pd.DataFrame(self.records)
+        if df.empty:
+            raise ValueError("No records to plot")
+
+        required_cols = {
+            "H2_input_mol_h",
+            "CO2_uptake_mol_h",
+            "cumulative_CO2_uptake_kg",
+            "SCP_g_protein_after_event",
+            "SCP_growth_rate_g_protein_h",
+            "H2_to_SCP_growth_ratio_mol_per_g",
+            "cumulative_SCP_growth_g_protein",
+            "total_SCP_available_g_protein",
+            "H2_maintenance_fraction",
+        }
+        missing = required_cols.difference(df.columns)
+        if missing:
+            raise ValueError(
+                "Missing capacity simulation columns: " + ", ".join(sorted(missing))
+            )
+
+        os.makedirs(figure_dir, exist_ok=True)
+        save_path = os.path.join(figure_dir, filename)
+
+        fig, axes = plt.subplots(6, 1, figsize=(12, 20), sharex=True)
+
+        axes[0].plot(
+            df["time_h"],
+            df["H2_input_mol_h"],
+            label="H2 feed rate",
+            color="tab:blue",
+        )
+        axes[0].set_ylabel("H2, mol/h")
+        axes[0].set_title("Injected H2 under capacity operation")
+        axes[0].grid(True, linestyle="--", alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(df["time_h"], df["CO2_uptake_mol_h"], label="CO2 uptake rate")
+        axes[1].plot(
+            df["time_h"],
+            df["cumulative_CO2_uptake_kg"],
+            label="Cumulative CO2 uptake",
+        )
+        axes[1].set_ylabel("CO2 mol/h or kg")
+        axes[1].set_title("CO2 uptake under H2 capacity operation")
+        axes[1].grid(True, linestyle="--", alpha=0.3)
+        axes[1].legend()
+
+        axes[2].plot(
+            df["time_h"],
+            df["SCP_g_protein_after_event"],
+            label="Active batch SCP",
+        )
+        axes[2].plot(
+            df["time_h"],
+            df["cumulative_SCP_growth_g_protein"],
+            label="Cumulative SCP growth",
+        )
+        axes[2].plot(
+            df["time_h"],
+            df["total_SCP_available_g_protein"],
+            label="Active + harvested SCP",
+        )
+        axes[2].set_ylabel("SCP, g protein")
+        axes[2].set_title("SCP growth under H2 capacity operation")
+        axes[2].grid(True, linestyle="--", alpha=0.3)
+        axes[2].legend()
+
+        axes[3].plot(
+            df["time_h"],
+            df["SCP_growth_rate_g_protein_h"],
+            label="SCP growth rate",
+            color="tab:green",
+        )
+        axes[3].set_ylabel("g protein/h")
+        axes[3].set_title("SCP growth rate under H2 capacity operation")
+        axes[3].grid(True, linestyle="--", alpha=0.3)
+        axes[3].legend()
+
+        axes[4].plot(
+            df["time_h"],
+            df["H2_to_SCP_growth_ratio_mol_per_g"],
+            label="H2 / SCP increment",
+            color="tab:purple",
+        )
+        axes[4].set_ylabel("mol H2/g protein")
+        axes[4].set_title("H2 input per SCP increment")
+        axes[4].grid(True, linestyle="--", alpha=0.3)
+        axes[4].legend()
+
+        axes[5].plot(
+            df["time_h"],
+            df["H2_maintenance_fraction"],
+            label="H2 maintenance fraction",
+        )
+        axes[5].axhline(
+            self.config.maintenance_fraction_cutoff,
+            linestyle="--",
+            color="tab:red",
+            label="Replacement cutoff",
+        )
+        axes[5].set_xlabel("Time, h")
+        axes[5].set_ylabel("Fraction")
+        axes[5].set_title("Share of H2 used for maintenance")
+        axes[5].set_ylim(-0.02, 1.02)
+        axes[5].grid(True, linestyle="--", alpha=0.3)
+        axes[5].legend()
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300)
+        plt.close(fig)
+        return save_path
 
     def summarize(self, df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
@@ -874,6 +1175,51 @@ class HOBHydrogenLoad:
         plt.tight_layout()
         plt.savefig(os.path.join(figure_dir, "hob_scp_per_h2.png"), dpi=300)
         plt.show()
+
+
+def simulate_and_plot_hob_capacity_operation(
+    X0_gdw: float = 5.0,
+    physical_h2_feed_max_mol_h: float = 4.0,
+    hours: float = 96.0,
+    dt_h: float = 1.0,
+    o2_per_h2_ratio: float = 0.40,
+    co2_per_h2_ratio: float = 0.125,
+    figure_dir: str = "figure",
+    csv_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Convenience function: create a HOB load, run capacity-limited H2 operation,
+    and plot CO2 uptake plus SCP growth curves.
+    """
+    config = HOBLoadConfig(
+        maintenance_fraction_cutoff=0.5,
+        min_runtime_before_replacement_h=24.0,
+        auto_replace=True,
+        restart_immediately_after_replacement=True,
+        reset_on_shutdown=True,
+        physical_h2_feed_max_mol_h=physical_h2_feed_max_mol_h,
+        enforce_h2_survival_min=True,
+    )
+    hob_load = HOBHydrogenLoad(
+        X0_gdw=X0_gdw,
+        params=HOBParams(),
+        load_config=config,
+        start_active=True,
+    )
+    df = hob_load.simulate_at_h2_capacity(
+        hours=hours,
+        dt_h=dt_h,
+        o2_per_h2_ratio=o2_per_h2_ratio,
+        co2_per_h2_ratio=co2_per_h2_ratio,
+    )
+    hob_load.plot_capacity_co2_scp(df, figure_dir=figure_dir)
+    if csv_path is not None:
+        folder = os.path.dirname(csv_path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        df.to_csv(csv_path, index=False)
+    return df
+
 
 
 if __name__ == "__main__":

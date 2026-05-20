@@ -62,6 +62,8 @@ class DDPGConfig:
     noise_decay: float = 0.995
     min_noise: float = 0.02
     seed: int = 8
+    random_train_window: bool = True
+    episode_window_hours: int = 72
 
 
 @dataclass
@@ -377,6 +379,41 @@ def split_scenario_data(data):
     split_lengths = {"train": train_hours, "test": test_hours, "validation": validation_hours}
     return split_data, split_lengths
 
+
+def slice_scenario_window(data, start_idx, window_length):
+    start_idx = int(start_idx)
+    window_length = int(window_length)
+    if window_length <= 0:
+        raise ValueError("window_length must be > 0")
+    end_idx = start_idx + window_length
+    total_hours = len(data.pv)
+    if start_idx < 0 or end_idx > total_hours:
+        raise ValueError(
+            f"Scenario window [{start_idx}, {end_idx}) exceeds available hours {total_hours}."
+        )
+    return ScenarioData(
+        pv=data.pv[start_idx:end_idx],
+        wind=data.wind[start_idx:end_idx],
+        load=data.load[start_idx:end_idx],
+        ev_demand=data.ev_demand[start_idx:end_idx],
+        t_out=data.t_out[start_idx:end_idx],
+        wind100=data.wind100[start_idx:end_idx],
+        irradiance=data.irradiance[start_idx:end_idx],
+    )
+
+
+def build_norm_stats(data):
+    return {
+        "pv_min": float(np.min(data.pv)),
+        "pv_max": float(np.max(data.pv)),
+        "wind_min": float(np.min(data.wind)),
+        "wind_max": float(np.max(data.wind)),
+        "load_min": float(np.min(data.load)),
+        "load_max": float(np.max(data.load)),
+        "t_out_min": float(np.min(data.t_out)),
+        "t_out_max": float(np.max(data.t_out)),
+    }
+
 def plot_bio_microgrid_results(
     pv,
     wind,
@@ -447,17 +484,29 @@ def plot_bio_microgrid_results(
 
 
 class MicrogridBioDDPGEnv:
-    def __init__(self, configs, pv_data, wind_data, load_data, ev_demand, t_data_C, rad_data_W_m2):
+    def __init__(
+        self,
+        configs,
+        pv_data,
+        wind_data,
+        load_data,
+        ev_demand,
+        t_data_C,
+        rad_data_W_m2,
+        norm_stats=None,
+    ):
         self.configs = configs
-        self.pv = np.asarray(pv_data, dtype=np.float32)
-        self.wind = np.asarray(wind_data, dtype=np.float32)
-        self.load = np.asarray(load_data, dtype=np.float32)
-        self.ev_demand = np.asarray(ev_demand, dtype=np.float32)
-        self.ev_h2_out_mol_h = self.ev_demand * configs.ev2fcev_ratio_mol * 1e-3 * 3600.0
-        self.ev_h2_out_max_mol_h = max(float(np.max(self.ev_h2_out_mol_h)), 1.0)
-        self.t_out = np.asarray(t_data_C, dtype=np.float32)
-        self.rad = np.asarray(rad_data_W_m2, dtype=np.float32)
-        self.horizon = len(self.pv)
+        initial_data = ScenarioData(
+            pv=np.asarray(pv_data, dtype=np.float32),
+            wind=np.asarray(wind_data, dtype=np.float32),
+            load=np.asarray(load_data, dtype=np.float32),
+            ev_demand=np.asarray(ev_demand, dtype=np.float32),
+            t_out=np.asarray(t_data_C, dtype=np.float32),
+            wind100=np.zeros_like(np.asarray(pv_data, dtype=np.float32)),
+            irradiance=np.asarray(rad_data_W_m2, dtype=np.float32),
+        )
+        self.norm_stats = dict(norm_stats) if norm_stats is not None else build_norm_stats(initial_data)
+        self.set_scenario_data(initial_data)
 
         self.building = smart_building()
         self.bio_load = FixedStrainHydrogenLoad(
@@ -491,6 +540,17 @@ class MicrogridBioDDPGEnv:
         self.action_dim = 4
         self.reset()
 
+    def set_scenario_data(self, scenario_data):
+        self.pv = np.asarray(scenario_data.pv, dtype=np.float32)
+        self.wind = np.asarray(scenario_data.wind, dtype=np.float32)
+        self.load = np.asarray(scenario_data.load, dtype=np.float32)
+        self.ev_demand = np.asarray(scenario_data.ev_demand, dtype=np.float32)
+        self.ev_h2_out_mol_h = self.ev_demand * self.configs.ev2fcev_ratio_mol * 1e-3 * 3600.0
+        self.ev_h2_out_max_mol_h = max(float(np.max(self.ev_h2_out_mol_h)), 1.0)
+        self.t_out = np.asarray(scenario_data.t_out, dtype=np.float32)
+        self.rad = np.asarray(scenario_data.irradiance, dtype=np.float32)
+        self.horizon = len(self.pv)
+
     def reset(self):
         self.t = 0
         self.h2_tank_mol = self.h2_initial
@@ -501,9 +561,9 @@ class MicrogridBioDDPGEnv:
         self.records = []
         return self._state()
 
-    def _safe_scale(self, value, arr):
-        high = float(np.max(arr))
-        low = float(np.min(arr))
+    def _safe_scale(self, value, key):
+        low = float(self.norm_stats[f"{key}_min"])
+        high = float(self.norm_stats[f"{key}_max"])
         return (float(value) - low) / (high - low + 1e-6)
 
     def _available_power_for_h2_mw(self, idx, building_mw=0.0):
@@ -570,10 +630,10 @@ class MicrogridBioDDPGEnv:
                 growth_fraction,
                 bio_age_h / max(self.bio_load.config.min_runtime_before_replacement_h, 1.0),
                 available_h2_power_mw / max(self.p_ez_max_mw, 1e-6),
-                self._safe_scale(self.pv[idx], self.pv),
-                self._safe_scale(self.wind[idx], self.wind),
-                self._safe_scale(self.load[idx], self.load),
-                self._safe_scale(self.t_out[idx], self.t_out),
+                self._safe_scale(self.pv[idx], "pv"),
+                self._safe_scale(self.wind[idx], "wind"),
+                self._safe_scale(self.load[idx], "load"),
+                self._safe_scale(self.t_out[idx], "t_out"),
                 ev_h2_out_fraction,
             ],
             dtype=np.float32,
@@ -861,7 +921,7 @@ class Critic(nn.Module):
         return self.net(torch.cat([state, action], dim=-1))
 
 
-class FeasibleActionProjector(nn.Module):
+class SafetyProjectionLayer(nn.Module):
     def __init__(
         self,
         p_ez_max_mw,
@@ -978,10 +1038,10 @@ class FeasibleActionProjector(nn.Module):
 
 
 class DDPGAgent:
-    def __init__(self, state_dim, action_dim, cfg, device, action_projector=None):
+    def __init__(self, state_dim, action_dim, cfg, device, safety_projection_layer=None):
         self.cfg = cfg
         self.device = device
-        self.action_projector = action_projector
+        self.safety_projection_layer = safety_projection_layer
         self.actor = Actor(state_dim, action_dim, cfg.hidden_dim).to(device)
         self.actor_target = Actor(state_dim, action_dim, cfg.hidden_dim).to(device)
         self.critic = Critic(state_dim, action_dim, cfg.hidden_dim).to(device)
@@ -998,16 +1058,16 @@ class DDPGAgent:
         if noise_std > 0:
             action = action + np.random.normal(0.0, noise_std, size=action.shape)
         action = np.clip(action, -1.0, 1.0).astype(np.float32)
-        if self.action_projector is not None:
+        if self.safety_projection_layer is not None:
             action_tensor = torch.as_tensor(action, dtype=torch.float32, device=self.device).unsqueeze(0)
             with torch.no_grad():
-                action = self.action_projector(state_tensor, action_tensor).cpu().numpy()[0]
+                action = self.safety_projection_layer(state_tensor, action_tensor).cpu().numpy()[0]
         return np.clip(action, -1.0, 1.0).astype(np.float32)
 
     def project_action(self, states, actions):
-        if self.action_projector is None:
+        if self.safety_projection_layer is None:
             return torch.clamp(actions, -1.0, 1.0)
-        return self.action_projector(states, actions)
+        return self.safety_projection_layer(states, actions)
 
     def learn(self, replay_buffer):
         states, actions, rewards, next_states, dones = replay_buffer.sample(self.cfg.batch_size)
@@ -1292,7 +1352,7 @@ def save_split_results(save_dir, split_name, scenario, records, reward, episode_
     }
     if episode_rewards is not None:
         payload["episode_rewards"] = np.asarray(episode_rewards, dtype=np.float32)
-    np.savez(os.path.join(save_dir, f"ddpg_microgrid_{split_name}_results.npz"), **payload)
+    np.savez(os.path.join(save_dir, f"basddpg_microgrid_{split_name}_results.npz"), **payload)
     plot_bio_microgrid_results(
         scenario.pv,
         scenario.wind,
@@ -1306,14 +1366,14 @@ def save_split_results(save_dir, split_name, scenario, records, reward, episode_
         result["T_room"],
         scenario.t_out,
         result["T_wall"],
-        save_path=os.path.join(save_dir, f"DDPG_{split_name}_overall_strategy.png"),
+        save_path=os.path.join(save_dir, f"BASDDPG_{split_name}_overall_strategy.png"),
     )
     return result
 
 
 def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
     ddpg_cfg = ddpg_cfg or DDPGConfig()
-    save_dir = save_dir or os.path.join(BASE_DIR, "DDPG_results")
+    save_dir = save_dir or os.path.join(BASE_DIR, "BASDDPG_result")
     os.makedirs(save_dir, exist_ok=True)
     set_seed(ddpg_cfg.seed)
 
@@ -1339,6 +1399,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
     train_data = split_data["train"]
     test_data = split_data["test"]
     validation_data = split_data["validation"]
+    norm_stats = build_norm_stats(train_data)
 
     env = MicrogridBioDDPGEnv(
         configs,
@@ -1348,6 +1409,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
         train_data.ev_demand,
         train_data.t_out,
         train_data.irradiance,
+        norm_stats=norm_stats,
     )
     validation_env = MicrogridBioDDPGEnv(
         configs,
@@ -1357,6 +1419,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
         validation_data.ev_demand,
         validation_data.t_out,
         validation_data.irradiance,
+        norm_stats=norm_stats,
     )
     test_env = MicrogridBioDDPGEnv(
         configs,
@@ -1366,10 +1429,11 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
         test_data.ev_demand,
         test_data.t_out,
         test_data.irradiance,
+        norm_stats=norm_stats,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    action_projector = FeasibleActionProjector(
+    safety_projection_layer = SafetyProjectionLayer(
         p_ez_max_mw=env.p_ez_max_mw,
         bio_h2_feed_max_mol_h=env.bio_h2_feed_max_mol_h,
         p_hvac_max_kw=env.p_hvac_max_kw,
@@ -1383,7 +1447,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
         ev_h2_out_max_mol_h=env.ev_h2_out_max_mol_h,
         q_h2_hydrogenase_cap=env.bio_load.params.q_h2_hydrogenase_cap,
     ).to(device)
-    agent = DDPGAgent(env.state_dim, env.action_dim, ddpg_cfg, device, action_projector)
+    agent = DDPGAgent(env.state_dim, env.action_dim, ddpg_cfg, device, safety_projection_layer)
     replay_buffer = ReplayBuffer(ddpg_cfg.buffer_size, env.state_dim, env.action_dim, device)
 
     episode_rewards = []
@@ -1395,6 +1459,25 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
     best_records = None
 
     for episode in range(1, ddpg_cfg.episodes + 1):
+        window_start = 0
+        window_hours = len(train_data.pv)
+        if ddpg_cfg.random_train_window:
+            window_hours = int(ddpg_cfg.episode_window_hours)
+            if window_hours <= 0:
+                raise ValueError("episode_window_hours must be > 0")
+            if window_hours > len(train_data.pv):
+                raise ValueError(
+                    "episode_window_hours cannot exceed the training set length."
+                )
+            max_start = len(train_data.pv) - window_hours
+            window_start = int(np.random.randint(0, max_start + 1))
+            train_episode_data = slice_scenario_window(
+                train_data, window_start, window_hours
+            )
+            env.set_scenario_data(train_episode_data)
+        else:
+            env.set_scenario_data(train_data)
+
         state = env.reset()
         done = False
         total_reward = 0.0
@@ -1430,12 +1513,12 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
             best_records = validation_records
             torch.save(agent.actor.state_dict(), os.path.join(save_dir, "actor_best.pth"))
 
-        if episode == 1 or episode % 10 == 0:
-            print(
-                f"Episode {episode:04d} | train_reward={total_reward:.3f} "
-                f"| test_reward={test_epoch_reward:.3f} "
-                f"| validation_reward={validation_reward:.3f} | noise={noise_std:.3f}"
-            )
+        print(
+            f"Episode {episode:04d} | window_start={window_start} "
+            f"| window_hours={window_hours} | train_reward={total_reward:.3f} "
+            f"| test_reward={test_epoch_reward:.3f} "
+            f"| validation_reward={validation_reward:.3f} | noise={noise_std:.3f}"
+        )
 
     if best_records is None:
         best_reward, best_records = evaluate_policy(validation_env, agent)
@@ -1444,6 +1527,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
     if os.path.exists(best_actor_path):
         agent.actor.load_state_dict(torch.load(best_actor_path, map_location=device))
 
+    env.set_scenario_data(train_data)
     train_reward, train_records = evaluate_policy(env, agent)
     validation_reward, validation_records = evaluate_policy(validation_env, agent)
     test_reward, test_records = evaluate_policy(test_env, agent)
@@ -1457,7 +1541,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
     test_result = save_split_results(save_dir, "test", test_data, test_records, test_reward)
 
     np.savez(
-        os.path.join(save_dir, "ddpg_split_summary.npz"),
+        os.path.join(save_dir, "basddpg_split_summary.npz"),
         train_hours=np.asarray([split_lengths["train"]], dtype=np.int32),
         test_hours=np.asarray([split_lengths["test"]], dtype=np.int32),
         validation_hours=np.asarray([split_lengths["validation"]], dtype=np.int32),
@@ -1479,11 +1563,22 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Solve the microgrid plus HOB-SCP bio-load scenario with DDPG.")
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--seed", type=int, default=8)
-    parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "DDPG_result"))
+    parser.add_argument("--episode-window-hours", type=int, default=72)
+    parser.add_argument(
+        "--no-random-train-window",
+        action="store_true",
+        help="Use the full training split for every episode instead of random windows.",
+    )
+    parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "BASDDPG_result"))
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    cfg = DDPGConfig(episodes=args.episodes, seed=args.seed)
+    cfg = DDPGConfig(
+        episodes=args.episodes,
+        seed=args.seed,
+        random_train_window=not args.no_random_train_window,
+        episode_window_hours=args.episode_window_hours,
+    )
     run_ddpg_optimization(Configs(), cfg, args.save_dir)

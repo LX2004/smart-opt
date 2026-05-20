@@ -49,7 +49,7 @@ class Configs:
 
 
 @dataclass
-class DDPGConfig:
+class TD3Config:
     episodes: int = 120
     batch_size: int = 256
     buffer_size: int = 200000
@@ -61,6 +61,9 @@ class DDPGConfig:
     exploration_noise: float = 0.15
     noise_decay: float = 0.995
     min_noise: float = 0.02
+    policy_noise: float = 0.20
+    noise_clip: float = 0.50
+    policy_delay: int = 2
     seed: int = 8
 
 
@@ -446,7 +449,7 @@ def plot_bio_microgrid_results(
     print(f"结果图片已成功保存至: {save_path}")
 
 
-class MicrogridBioDDPGEnv:
+class MicrogridBioTD3Env:
     def __init__(self, configs, pv_data, wind_data, load_data, ev_demand, t_data_C, rad_data_W_m2):
         self.configs = configs
         self.pv = np.asarray(pv_data, dtype=np.float32)
@@ -840,10 +843,16 @@ class Actor(nn.Module):
         return self.net(state)
 
 
-class Critic(nn.Module):
+
+class TwinCritic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim):
         super().__init__()
-        self.net = nn.Sequential(
+        self.q1 = self._make_q_network(state_dim, action_dim)
+        self.q2 = self._make_q_network(state_dim, action_dim)
+
+    @staticmethod
+    def _make_q_network(state_dim, action_dim):
+        return nn.Sequential(
             nn.Linear(state_dim + action_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 128),
@@ -858,7 +867,11 @@ class Critic(nn.Module):
         )
 
     def forward(self, state, action):
-        return self.net(torch.cat([state, action], dim=-1))
+        state_action = torch.cat([state, action], dim=-1)
+        return self.q1(state_action), self.q2(state_action)
+
+    def q1_forward(self, state, action):
+        return self.q1(torch.cat([state, action], dim=-1))
 
 
 class FeasibleActionProjector(nn.Module):
@@ -977,15 +990,16 @@ class FeasibleActionProjector(nn.Module):
         return projected
 
 
-class DDPGAgent:
+class TD3Agent:
     def __init__(self, state_dim, action_dim, cfg, device, action_projector=None):
         self.cfg = cfg
         self.device = device
         self.action_projector = action_projector
+        self.total_it = 0
         self.actor = Actor(state_dim, action_dim, cfg.hidden_dim).to(device)
         self.actor_target = Actor(state_dim, action_dim, cfg.hidden_dim).to(device)
-        self.critic = Critic(state_dim, action_dim, cfg.hidden_dim).to(device)
-        self.critic_target = Critic(state_dim, action_dim, cfg.hidden_dim).to(device)
+        self.critic = TwinCritic(state_dim, action_dim, cfg.hidden_dim).to(device)
+        self.critic_target = TwinCritic(state_dim, action_dim, cfg.hidden_dim).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
@@ -1010,27 +1024,36 @@ class DDPGAgent:
         return self.action_projector(states, actions)
 
     def learn(self, replay_buffer):
+        self.total_it += 1
         states, actions, rewards, next_states, dones = replay_buffer.sample(self.cfg.batch_size)
         with torch.no_grad():
-            next_actions = self.project_action(next_states, self.actor_target(next_states))
-            target_q = self.critic_target(next_states, next_actions)
+            next_actions = self.actor_target(next_states)
+            smoothing_noise = torch.randn_like(next_actions) * self.cfg.policy_noise
+            smoothing_noise = torch.clamp(smoothing_noise, -self.cfg.noise_clip, self.cfg.noise_clip)
+            next_actions = self.project_action(next_states, next_actions + smoothing_noise)
+            target_q1, target_q2 = self.critic_target(next_states, next_actions)
+            target_q = torch.minimum(target_q1, target_q2)
             target = rewards + self.cfg.gamma * (1.0 - dones) * target_q
 
-        current_q = self.critic(states, actions)
-        critic_loss = F.mse_loss(current_q, target)
+        current_q1, current_q2 = self.critic(states, actions)
+        critic_loss = F.mse_loss(current_q1, target) + F.mse_loss(current_q2, target)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        actor_actions = self.project_action(states, self.actor(states))
-        actor_loss = -self.critic(states, actor_actions).mean()
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+        actor_loss_value = 0.0
+        if self.total_it % self.cfg.policy_delay == 0:
+            actor_actions = self.project_action(states, self.actor(states))
+            actor_loss = -self.critic.q1_forward(states, actor_actions).mean()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+            actor_loss_value = float(actor_loss.item())
 
-        self._soft_update(self.actor_target, self.actor)
-        self._soft_update(self.critic_target, self.critic)
-        return float(actor_loss.item()), float(critic_loss.item())
+            self._soft_update(self.actor_target, self.actor)
+            self._soft_update(self.critic_target, self.critic)
+
+        return actor_loss_value, float(critic_loss.item())
 
     def _soft_update(self, target, source):
         for target_param, source_param in zip(target.parameters(), source.parameters()):
@@ -1292,7 +1315,7 @@ def save_split_results(save_dir, split_name, scenario, records, reward, episode_
     }
     if episode_rewards is not None:
         payload["episode_rewards"] = np.asarray(episode_rewards, dtype=np.float32)
-    np.savez(os.path.join(save_dir, f"ddpg_microgrid_{split_name}_results.npz"), **payload)
+    np.savez(os.path.join(save_dir, f"td3_microgrid_{split_name}_results.npz"), **payload)
     plot_bio_microgrid_results(
         scenario.pv,
         scenario.wind,
@@ -1306,16 +1329,16 @@ def save_split_results(save_dir, split_name, scenario, records, reward, episode_
         result["T_room"],
         scenario.t_out,
         result["T_wall"],
-        save_path=os.path.join(save_dir, f"DDPG_{split_name}_overall_strategy.png"),
+        save_path=os.path.join(save_dir, f"TD3_{split_name}_overall_strategy.png"),
     )
     return result
 
 
-def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
-    ddpg_cfg = ddpg_cfg or DDPGConfig()
-    save_dir = save_dir or os.path.join(BASE_DIR, "DDPG_results")
+def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
+    td3_cfg = td3_cfg or TD3Config()
+    save_dir = save_dir or os.path.join(BASE_DIR, "TD3_result")
     os.makedirs(save_dir, exist_ok=True)
-    set_seed(ddpg_cfg.seed)
+    set_seed(td3_cfg.seed)
 
     full_data = load_scenario_data(configs)
     source_load_csv_path = os.path.join(save_dir, "source_load_match.csv")
@@ -1340,7 +1363,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
     test_data = split_data["test"]
     validation_data = split_data["validation"]
 
-    env = MicrogridBioDDPGEnv(
+    env = MicrogridBioTD3Env(
         configs,
         train_data.pv,
         train_data.wind,
@@ -1349,7 +1372,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
         train_data.t_out,
         train_data.irradiance,
     )
-    validation_env = MicrogridBioDDPGEnv(
+    validation_env = MicrogridBioTD3Env(
         configs,
         validation_data.pv,
         validation_data.wind,
@@ -1358,7 +1381,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
         validation_data.t_out,
         validation_data.irradiance,
     )
-    test_env = MicrogridBioDDPGEnv(
+    test_env = MicrogridBioTD3Env(
         configs,
         test_data.pv,
         test_data.wind,
@@ -1383,18 +1406,18 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
         ev_h2_out_max_mol_h=env.ev_h2_out_max_mol_h,
         q_h2_hydrogenase_cap=env.bio_load.params.q_h2_hydrogenase_cap,
     ).to(device)
-    agent = DDPGAgent(env.state_dim, env.action_dim, ddpg_cfg, device, action_projector)
-    replay_buffer = ReplayBuffer(ddpg_cfg.buffer_size, env.state_dim, env.action_dim, device)
+    agent = TD3Agent(env.state_dim, env.action_dim, td3_cfg, device, action_projector)
+    replay_buffer = ReplayBuffer(td3_cfg.buffer_size, env.state_dim, env.action_dim, device)
 
     episode_rewards = []
     epoch_train_reward_rows = []
     epoch_test_reward_rows = []
     epoch_all_reward_rows = []
-    noise_std = ddpg_cfg.exploration_noise
+    noise_std = td3_cfg.exploration_noise
     best_reward = -np.inf
     best_records = None
 
-    for episode in range(1, ddpg_cfg.episodes + 1):
+    for episode in range(1, td3_cfg.episodes + 1):
         state = env.reset()
         done = False
         total_reward = 0.0
@@ -1404,7 +1427,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
             replay_buffer.store(state, info["executed_action"], reward, next_state, float(done))
             state = next_state
             total_reward += reward
-            if replay_buffer.size >= ddpg_cfg.batch_size:
+            if replay_buffer.size >= td3_cfg.batch_size:
                 agent.learn(replay_buffer)
 
         episode_rewards.append(total_reward)
@@ -1423,7 +1446,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
         write_epoch_reward_history_csv(save_dir, "test", epoch_test_reward_rows)
         write_combined_epoch_reward_history_csv(save_dir, epoch_all_reward_rows)
 
-        noise_std = max(ddpg_cfg.min_noise, noise_std * ddpg_cfg.noise_decay)
+        noise_std = max(td3_cfg.min_noise, noise_std * td3_cfg.noise_decay)
         validation_reward, validation_records = evaluate_policy(validation_env, agent)
         if validation_reward > best_reward:
             best_reward = validation_reward
@@ -1457,7 +1480,7 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
     test_result = save_split_results(save_dir, "test", test_data, test_records, test_reward)
 
     np.savez(
-        os.path.join(save_dir, "ddpg_split_summary.npz"),
+        os.path.join(save_dir, "td3_split_summary.npz"),
         train_hours=np.asarray([split_lengths["train"]], dtype=np.int32),
         test_hours=np.asarray([split_lengths["test"]], dtype=np.int32),
         validation_hours=np.asarray([split_lengths["validation"]], dtype=np.int32),
@@ -1476,14 +1499,14 @@ def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
     return {"train": train_result, "validation": validation_result, "test": test_result}, episode_rewards
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Solve the microgrid plus HOB-SCP bio-load scenario with DDPG.")
+    parser = argparse.ArgumentParser(description="Solve the microgrid plus HOB-SCP bio-load scenario with TD3.")
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--seed", type=int, default=8)
-    parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "DDPG_result"))
+    parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "TD3_result"))
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    cfg = DDPGConfig(episodes=args.episodes, seed=args.seed)
-    run_ddpg_optimization(Configs(), cfg, args.save_dir)
+    cfg = TD3Config(episodes=args.episodes, seed=args.seed)
+    run_td3_optimization(Configs(), cfg, args.save_dir)
