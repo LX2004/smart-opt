@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from eq import ElectrolyzerSystem, PV, smart_building, wind_turbine
+from eq import PV, smart_building, wind_turbine
 from utils import get_weather_data
 from bio_load import HOBHydrogenLoad, HOBLoadConfig, HOBParams
 
@@ -39,11 +39,14 @@ class Configs:
         self.num_cell = 2e3
         self.area = 1000
 
-        self.ev2fcev_ratio_mol = 1 / 15 * 500
+        self.ev2fcev_ratio_mol = 200.0
+        self.h2_electrolyzer_kwh_per_mol = 0.1135
         self.human_comfort_temp = 24
-        self.building_num = 100
+        self.building_num = 10
         self.wind_turbine_num = 100
-        self.source_to_load_ratio = 1.2
+        self.source_to_load_ratio = 1.3
+        self.ev_to_bio_h2_ratio = 0.2
+        self.electric_load_to_bio_electric_ratio = 0.2
         self.grid_emission_factor_tco2_per_mwh = 0.5703
         self.co2_molar_mass_g_per_mol = 44.0095
 
@@ -65,6 +68,8 @@ class TD3Config:
     noise_clip: float = 0.50
     policy_delay: int = 2
     seed: int = 8
+    random_train_window: bool = True
+    episode_window_hours: int = 72
 
 
 @dataclass
@@ -88,10 +93,10 @@ class FixedStrainHydrogenLoad:
 
     def __init__(
         self,
-        fixed_X0_gdw=10.0,
+        fixed_X0_gdw=100.0,
         h2_growth_fraction_cutoff=0.5,
         min_runtime_before_replacement_h=24.0,
-        physical_h2_feed_max_mol_h=40.0,
+        physical_h2_feed_max_mol_h=5000.0,
         severe_h2_shortfall_cutoff_h=6.0,
     ):
         self.fixed_X0_gdw = float(fixed_X0_gdw)
@@ -272,25 +277,47 @@ def load_scenario_data(configs, horizon=None):
     )
 
 
-def _hydrogen_mol_s_to_electrolyzer_mw(h2_mol_s, ez_efficiency):
-    return np.asarray(h2_mol_s, dtype=np.float32) / max(ez_efficiency * 1e6, 1e-12)
+def _hydrogen_mol_h_to_electrolyzer_mw(h2_mol_h, h2_electrolyzer_kwh_per_mol):
+    h2_mol_h = np.asarray(h2_mol_h, dtype=np.float32)
+    return h2_mol_h * float(h2_electrolyzer_kwh_per_mol) / 1000.0
 
 
-def _hydrogen_mol_h_to_electrolyzer_mw(h2_mol_h, ez_efficiency):
-    return _hydrogen_mol_s_to_electrolyzer_mw(float(h2_mol_h) / 3600.0, ez_efficiency)
+def _electrolyzer_mw_to_hydrogen_mol_h(p_ez_mw, h2_electrolyzer_kwh_per_mol):
+    p_ez_mw = np.asarray(p_ez_mw, dtype=np.float32)
+    return p_ez_mw * 1000.0 / max(float(h2_electrolyzer_kwh_per_mol), 1e-12)
 
 
 def match_source_to_load_ratio(data, configs, bio_h2_feed_max_mol_h, csv_path=None):
-    ez_efficiency = ElectrolyzerSystem(configs).step(1000) / 1000
+    h2_electrolyzer_kwh_per_mol = configs.h2_electrolyzer_kwh_per_mol
     source_mwh_before = float(np.sum(data.pv + data.wind))
-    electric_load_mwh = float(np.sum(data.load))
+    raw_electric_load_mwh = float(np.sum(data.load))
 
-    ev_h2_mol_s = data.ev_demand * configs.ev2fcev_ratio_mol * 1e-3
-    ev_h2_electric_mw = _hydrogen_mol_s_to_electrolyzer_mw(ev_h2_mol_s, ez_efficiency)
-    bio_h2_electric_mw = float(_hydrogen_mol_h_to_electrolyzer_mw(bio_h2_feed_max_mol_h, ez_efficiency))
+    horizon = len(data.load)
+    bio_h2_electric_mw = float(_hydrogen_mol_h_to_electrolyzer_mw(bio_h2_feed_max_mol_h, h2_electrolyzer_kwh_per_mol))
+    bio_h2_electric_mwh = float(bio_h2_electric_mw * horizon)
+    bio_h2_total_mol = float(bio_h2_feed_max_mol_h * horizon)
 
+    ev_to_bio_h2_ratio = float(getattr(configs, "ev_to_bio_h2_ratio", 0.2))
+    electric_load_to_bio_electric_ratio = float(getattr(configs, "electric_load_to_bio_electric_ratio", 0.2))
+
+    raw_ev_h2_mol_h = data.ev_demand * configs.ev2fcev_ratio_mol
+    raw_ev_h2_total_mol = float(np.sum(raw_ev_h2_mol_h))
+    target_ev_h2_total_mol = bio_h2_total_mol * ev_to_bio_h2_ratio
+    if raw_ev_h2_total_mol <= 0.0:
+        raise ValueError("Total EV hydrogen demand must be positive for EV-to-bio scaling.")
+    ev_demand_scale = target_ev_h2_total_mol / raw_ev_h2_total_mol
+    matched_ev_demand = (data.ev_demand * ev_demand_scale).astype(np.float32)
+    ev_h2_mol_h = matched_ev_demand * configs.ev2fcev_ratio_mol
+    ev_h2_electric_mw = _hydrogen_mol_h_to_electrolyzer_mw(ev_h2_mol_h, h2_electrolyzer_kwh_per_mol)
     ev_h2_electric_mwh = float(np.sum(ev_h2_electric_mw))
-    bio_h2_electric_mwh = float(bio_h2_electric_mw * len(data.load))
+
+    target_electric_load_mwh = bio_h2_electric_mwh * electric_load_to_bio_electric_ratio
+    if raw_electric_load_mwh <= 0.0:
+        raise ValueError("Total electric load must be positive for electric-load-to-bio scaling.")
+    electric_load_scale = target_electric_load_mwh / raw_electric_load_mwh
+    matched_load = (data.load * electric_load_scale).astype(np.float32)
+    electric_load_mwh = float(np.sum(matched_load))
+
     total_load_mwh = electric_load_mwh + ev_h2_electric_mwh + bio_h2_electric_mwh
     target_source_mwh = float(configs.source_to_load_ratio * total_load_mwh)
 
@@ -301,26 +328,35 @@ def match_source_to_load_ratio(data, configs, bio_h2_feed_max_mol_h, csv_path=No
     matched = ScenarioData(
         pv=(data.pv * source_scale).astype(np.float32),
         wind=(data.wind * source_scale).astype(np.float32),
-        load=data.load,
-        ev_demand=data.ev_demand,
+        load=matched_load,
+        ev_demand=matched_ev_demand,
         t_out=data.t_out,
         wind100=data.wind100,
         irradiance=data.irradiance,
     )
-    
+
     source_after_mw = matched.pv + matched.wind
-    total_load_equivalent_mw = data.load + ev_h2_electric_mw + bio_h2_electric_mw
+    total_load_equivalent_mw = matched.load + ev_h2_electric_mw + bio_h2_electric_mw
     summary = {
         "source_to_load_ratio": float(configs.source_to_load_ratio),
         "source_scale": float(source_scale),
         "source_mwh_before": source_mwh_before,
         "source_mwh_after": float(np.sum(source_after_mw)),
+        "raw_electric_load_mwh": raw_electric_load_mwh,
         "electric_load_mwh": electric_load_mwh,
+        "electric_load_scale": float(electric_load_scale),
+        "electric_load_to_bio_electric_ratio": electric_load_to_bio_electric_ratio,
+        "raw_ev_h2_total_mol": raw_ev_h2_total_mol,
+        "ev_h2_total_mol": float(np.sum(ev_h2_mol_h)),
+        "ev_demand_scale": float(ev_demand_scale),
+        "ev_to_bio_h2_ratio": ev_to_bio_h2_ratio,
         "ev_h2_electric_mwh": ev_h2_electric_mwh,
+        "bio_h2_total_mol": bio_h2_total_mol,
         "bio_h2_electric_mwh": bio_h2_electric_mwh,
         "total_load_equivalent_mwh": total_load_mwh,
         "target_source_mwh": target_source_mwh,
         "bio_h2_feed_max_mol_h": float(bio_h2_feed_max_mol_h),
+        "h2_electrolyzer_kwh_per_mol": float(configs.h2_electrolyzer_kwh_per_mol),
     }
     if csv_path is not None:
         folder = os.path.dirname(csv_path)
@@ -329,30 +365,27 @@ def match_source_to_load_ratio(data, configs, bio_h2_feed_max_mol_h, csv_path=No
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "hour",
-                "pv_mw",
-                "wind_mw",
-                "source_mw",
-                "electric_load_mw",
-                "ev_h2_equivalent_electric_mw",
-                "bio_h2_equivalent_electric_mw",
-                "total_load_equivalent_mw",
-                "target_source_to_load_ratio",
+                "Time",
+                "PV(kW)",
+                "Wind(kW)",
+                "HFCV(mol)",
+                "HFCV(kW)",
+                "bioload(mol)",
+                "bioload(kW)",
+                "Load(kW)",
             ])
-            for i in range(len(data.load)):
+            for i in range(horizon):
                 writer.writerow([
                     i,
-                    float(matched.pv[i]),
-                    float(matched.wind[i]),
-                    float(source_after_mw[i]),
-                    float(data.load[i]),
-                    float(ev_h2_electric_mw[i]),
-                    float(bio_h2_electric_mw),
-                    float(total_load_equivalent_mw[i]),
-                    float(configs.source_to_load_ratio),
+                    float(matched.pv[i] * 1000.0),
+                    float(matched.wind[i] * 1000.0),
+                    float(ev_h2_mol_h[i]),
+                    float(ev_h2_mol_h[i] * h2_electrolyzer_kwh_per_mol),
+                    float(bio_h2_feed_max_mol_h),
+                    float(bio_h2_feed_max_mol_h * h2_electrolyzer_kwh_per_mol),
+                    float(matched.load[i] * 1000.0),
                 ])
     return matched, summary
-
 
 def split_scenario_data(data):
     total_hours = len(data.ev_demand)
@@ -379,6 +412,41 @@ def split_scenario_data(data):
     split_data = {name: make_slice(*bounds) for name, bounds in split_hours.items()}
     split_lengths = {"train": train_hours, "test": test_hours, "validation": validation_hours}
     return split_data, split_lengths
+
+
+def slice_scenario_window(data, start_idx, window_length):
+    start_idx = int(start_idx)
+    window_length = int(window_length)
+    if window_length <= 0:
+        raise ValueError("window_length must be > 0")
+    end_idx = start_idx + window_length
+    total_hours = len(data.pv)
+    if start_idx < 0 or end_idx > total_hours:
+        raise ValueError(
+            f"Scenario window [{start_idx}, {end_idx}) exceeds available hours {total_hours}."
+        )
+    return ScenarioData(
+        pv=data.pv[start_idx:end_idx],
+        wind=data.wind[start_idx:end_idx],
+        load=data.load[start_idx:end_idx],
+        ev_demand=data.ev_demand[start_idx:end_idx],
+        t_out=data.t_out[start_idx:end_idx],
+        wind100=data.wind100[start_idx:end_idx],
+        irradiance=data.irradiance[start_idx:end_idx],
+    )
+
+
+def build_norm_stats(data):
+    return {
+        "pv_min": float(np.min(data.pv)),
+        "pv_max": float(np.max(data.pv)),
+        "wind_min": float(np.min(data.wind)),
+        "wind_max": float(np.max(data.wind)),
+        "load_min": float(np.min(data.load)),
+        "load_max": float(np.max(data.load)),
+        "t_out_min": float(np.min(data.t_out)),
+        "t_out_max": float(np.max(data.t_out)),
+    }
 
 def plot_bio_microgrid_results(
     pv,
@@ -450,26 +518,38 @@ def plot_bio_microgrid_results(
 
 
 class MicrogridBioTD3Env:
-    def __init__(self, configs, pv_data, wind_data, load_data, ev_demand, t_data_C, rad_data_W_m2):
+    def __init__(
+        self,
+        configs,
+        pv_data,
+        wind_data,
+        load_data,
+        ev_demand,
+        t_data_C,
+        rad_data_W_m2,
+        norm_stats=None,
+    ):
         self.configs = configs
-        self.pv = np.asarray(pv_data, dtype=np.float32)
-        self.wind = np.asarray(wind_data, dtype=np.float32)
-        self.load = np.asarray(load_data, dtype=np.float32)
-        self.ev_demand = np.asarray(ev_demand, dtype=np.float32)
-        self.ev_h2_out_mol_h = self.ev_demand * configs.ev2fcev_ratio_mol * 1e-3 * 3600.0
-        self.ev_h2_out_max_mol_h = max(float(np.max(self.ev_h2_out_mol_h)), 1.0)
-        self.t_out = np.asarray(t_data_C, dtype=np.float32)
-        self.rad = np.asarray(rad_data_W_m2, dtype=np.float32)
-        self.horizon = len(self.pv)
+        initial_data = ScenarioData(
+            pv=np.asarray(pv_data, dtype=np.float32),
+            wind=np.asarray(wind_data, dtype=np.float32),
+            load=np.asarray(load_data, dtype=np.float32),
+            ev_demand=np.asarray(ev_demand, dtype=np.float32),
+            t_out=np.asarray(t_data_C, dtype=np.float32),
+            wind100=np.zeros_like(np.asarray(pv_data, dtype=np.float32)),
+            irradiance=np.asarray(rad_data_W_m2, dtype=np.float32),
+        )
+        self.norm_stats = dict(norm_stats) if norm_stats is not None else build_norm_stats(initial_data)
+        self.set_scenario_data(initial_data)
 
         self.building = smart_building()
         self.bio_load = FixedStrainHydrogenLoad(
-            fixed_X0_gdw=10.0,
+            fixed_X0_gdw=100.0,
             h2_growth_fraction_cutoff=0.5,
             min_runtime_before_replacement_h=24.0,
-            physical_h2_feed_max_mol_h=40.0,
+            physical_h2_feed_max_mol_h=5000.0,
         )
-        self.ez_efficiency = ElectrolyzerSystem(configs).step(1000) / 1000
+        self.h2_electrolyzer_kwh_per_mol = configs.h2_electrolyzer_kwh_per_mol
 
         self.h2_min = configs.h2_tank_mol_min * configs.h2_tank_num
         self.h2_max = configs.h2_tank_mol_max * configs.h2_tank_num
@@ -485,14 +565,25 @@ class MicrogridBioTD3Env:
         self.bio_starvation_penalty_weight = 20.0
         self.bio_forced_replacement_penalty_weight = 200.0
         self.carbon_penalty_weight = 1.0
-        self.battery_capacity_mwh = 50.0
-        self.battery_power_max_mw = 25.0
+        self.battery_capacity_mwh = 2.0
+        self.battery_power_max_mw = 2.0
         self.battery_efficiency = 0.9
         self.battery_initial_mwh = 0.5 * self.battery_capacity_mwh
 
         self.state_dim = 18
         self.action_dim = 4
         self.reset()
+
+    def set_scenario_data(self, scenario_data):
+        self.pv = np.asarray(scenario_data.pv, dtype=np.float32)
+        self.wind = np.asarray(scenario_data.wind, dtype=np.float32)
+        self.load = np.asarray(scenario_data.load, dtype=np.float32)
+        self.ev_demand = np.asarray(scenario_data.ev_demand, dtype=np.float32)
+        self.ev_h2_out_mol_h = self.ev_demand * self.configs.ev2fcev_ratio_mol
+        self.ev_h2_out_max_mol_h = max(float(np.max(self.ev_h2_out_mol_h)), 1.0)
+        self.t_out = np.asarray(scenario_data.t_out, dtype=np.float32)
+        self.rad = np.asarray(scenario_data.irradiance, dtype=np.float32)
+        self.horizon = len(self.pv)
 
     def reset(self):
         self.t = 0
@@ -504,9 +595,9 @@ class MicrogridBioTD3Env:
         self.records = []
         return self._state()
 
-    def _safe_scale(self, value, arr):
-        high = float(np.max(arr))
-        low = float(np.min(arr))
+    def _safe_scale(self, value, key):
+        low = float(self.norm_stats[f"{key}_min"])
+        high = float(self.norm_stats[f"{key}_max"])
         return (float(value) - low) / (high - low + 1e-6)
 
     def _available_power_for_h2_mw(self, idx, building_mw=0.0):
@@ -573,10 +664,10 @@ class MicrogridBioTD3Env:
                 growth_fraction,
                 bio_age_h / max(self.bio_load.config.min_runtime_before_replacement_h, 1.0),
                 available_h2_power_mw / max(self.p_ez_max_mw, 1e-6),
-                self._safe_scale(self.pv[idx], self.pv),
-                self._safe_scale(self.wind[idx], self.wind),
-                self._safe_scale(self.load[idx], self.load),
-                self._safe_scale(self.t_out[idx], self.t_out),
+                self._safe_scale(self.pv[idx], "pv"),
+                self._safe_scale(self.wind[idx], "wind"),
+                self._safe_scale(self.load[idx], "load"),
+                self._safe_scale(self.t_out[idx], "t_out"),
                 ev_h2_out_fraction,
             ],
             dtype=np.float32,
@@ -587,9 +678,9 @@ class MicrogridBioTD3Env:
         scaled = (action + 1.0) * 0.5
         p_ez_mw = float(scaled[0] * self.p_ez_max_mw)
         bio_h2_feed_mol_h = float(scaled[1] * self.bio_h2_feed_max_mol_h)
-        p_hvac_kw = float(scaled[2] * self.p_hvac_max_kw)
+        p_hvac_request_kw = float(scaled[2] * self.p_hvac_max_kw)
         battery_command_mw = float(action[3] * self.battery_power_max_mw)
-        return p_ez_mw, bio_h2_feed_mol_h, p_hvac_kw, battery_command_mw
+        return p_ez_mw, bio_h2_feed_mol_h, p_hvac_request_kw, battery_command_mw
 
     def _physical_to_action(self, p_ez_mw, bio_h2_feed_mol_h, p_hvac_kw, battery_power_mw):
         return np.asarray(
@@ -653,8 +744,13 @@ class MicrogridBioTD3Env:
 
     def step(self, action):
         idx = self.t
-        p_ez_command_mw, bio_h2_feed_mol_h, p_hvac_kw, battery_command_mw = self._map_action(action)
-        building_mw = p_hvac_kw * 1e-3 * self.configs.building_num
+        p_ez_command_mw, bio_h2_feed_mol_h, p_hvac_request_kw, battery_command_mw = self._map_action(action)
+        hvac = self.building.split_hvac_power(self.T_in, p_hvac_request_kw)
+        hvac_mode = hvac["mode"]
+        p_heat_kw = hvac["p_heat_kw"]
+        p_cool_kw = hvac["p_cool_kw"]
+        p_hvac_electric_kw = hvac["p_hvac_electric_kw"]
+        building_mw = p_hvac_electric_kw * 1e-3 * self.configs.building_num
 
         supply = float(self.pv[idx] + self.wind[idx])
         electric_load_mw = float(self.load[idx] + building_mw)
@@ -673,7 +769,7 @@ class MicrogridBioTD3Env:
         grid_purchase_mwh = max(-surplus, 0.0)
 
         bio_min_survival_h2_mol_h = self.bio_load.minimum_survival_h2_mol_h()
-        h2_in_mol_h = p_ez_mw * self.ez_efficiency * 1e6 * 3600.0
+        h2_in_mol_h = p_ez_mw * 1000.0 / max(self.h2_electrolyzer_kwh_per_mol, 1e-12)
         ev_h2_out_mol_h = float(self.ev_h2_out_mol_h[idx])
         h2_after_ev_mol = self.h2_tank_mol - ev_h2_out_mol_h
         bio_available_h2_mol_h = max(0.0, h2_after_ev_mol + h2_in_mol_h - self.h2_min)
@@ -689,13 +785,13 @@ class MicrogridBioTD3Env:
         executed_action = self._physical_to_action(
             p_ez_mw,
             bio["bio_h2_feed_mol_h"],
-            p_hvac_kw,
+            p_hvac_electric_kw,
             battery["battery_power_mw"],
         )
 
         q_from_wall = (self.T_wall - self.T_in) / self.building.r1
         q_from_out = (float(self.t_out[idx]) - self.T_in) / self.building.rwind
-        q_hvac = self.building.COP * p_hvac_kw
+        q_hvac = self.building.COP_heating * p_heat_kw - self.building.COP_cooling * p_cool_kw
         next_T_in = self.T_in + (q_from_wall + q_from_out + q_hvac) / self.building.czone
 
         q_out_to_wall = (float(self.t_out[idx]) - self.T_wall) / self.building.r1
@@ -707,7 +803,8 @@ class MicrogridBioTD3Env:
         self.T_in = float(np.clip(next_T_in, -20.0, 40.0))
         self.T_wall = float(np.clip(next_T_wall, -20.0, 40.0))
 
-        comfort_cost = (self.T_in - self.configs.human_comfort_temp) ** 2
+        comfort_violation = self.building.comfort_violation(self.T_in)
+        comfort_cost = comfort_violation**2
         weighted_comfort_cost = 0.1 * comfort_cost
         h2_cost = 1e-8 * h2_violation**2
         grid_co2_emission_t = grid_purchase_mwh * self.configs.grid_emission_factor_tco2_per_mwh
@@ -752,6 +849,12 @@ class MicrogridBioTD3Env:
                 "carbon_cost": carbon_cost,
                 "h2_tank_mol": self.h2_tank_mol,
                 "building_mw": building_mw,
+                "hvac_mode": hvac_mode,
+                "p_hvac_request_kw": p_hvac_request_kw,
+                "p_heat_kw": p_heat_kw,
+                "p_cool_kw": p_cool_kw,
+                "p_hvac_electric_kw": p_hvac_electric_kw,
+                "q_hvac": q_hvac,
                 "bio_min_survival_h2_mol_h": bio_min_survival_h2_mol_h,
                 "bio_starvation_shortage_mol_h": bio_starvation_shortage_mol_h,
                 "bio_starvation_cost": bio_starvation_cost,
@@ -772,6 +875,7 @@ class MicrogridBioTD3Env:
                 "T_room": self.T_in,
                 "T_wall": self.T_wall,
                 "curtail_cost": curtail_mw,
+                "comfort_violation_C": comfort_violation,
                 "comfort_cost_raw": comfort_cost,
                 "comfort_cost_weighted": weighted_comfort_cost,
                 "h2_tank_violation_mol": h2_violation,
@@ -881,10 +985,13 @@ class FeasibleActionProjector(nn.Module):
         bio_h2_feed_max_mol_h,
         p_hvac_max_kw,
         building_num,
+        comfort_temp_min,
+        comfort_temp_max,
+        pre_cooling_temp,
         battery_capacity_mwh,
         battery_power_max_mw,
         battery_efficiency,
-        ez_efficiency,
+        h2_electrolyzer_kwh_per_mol,
         h2_min_mol,
         h2_max_mol,
         ev_h2_out_max_mol_h,
@@ -895,10 +1002,13 @@ class FeasibleActionProjector(nn.Module):
         self.bio_h2_feed_max_mol_h = float(bio_h2_feed_max_mol_h)
         self.p_hvac_max_kw = float(p_hvac_max_kw)
         self.building_num = float(building_num)
+        self.comfort_temp_min = float(comfort_temp_min)
+        self.comfort_temp_max = float(comfort_temp_max)
+        self.pre_cooling_temp = float(pre_cooling_temp)
         self.battery_capacity_mwh = float(battery_capacity_mwh)
         self.battery_power_max_mw = float(battery_power_max_mw)
         self.battery_efficiency = float(battery_efficiency)
-        self.ez_efficiency = float(ez_efficiency)
+        self.h2_electrolyzer_kwh_per_mol = float(h2_electrolyzer_kwh_per_mol)
         self.h2_min_mol = float(h2_min_mol)
         self.h2_max_mol = float(h2_max_mol)
         self.ev_h2_out_max_mol_h = float(ev_h2_out_max_mol_h)
@@ -916,11 +1026,19 @@ class FeasibleActionProjector(nn.Module):
 
         p_ez_command_mw = scaled[:, 0:1] * self.p_ez_max_mw
         bio_h2_command_mol_h = scaled[:, 1:2] * self.bio_h2_feed_max_mol_h
-        p_hvac_kw = scaled[:, 2:3] * self.p_hvac_max_kw
+        p_hvac_request_kw = scaled[:, 2:3] * self.p_hvac_max_kw
         battery_command_mw = action[:, 3:4] * self.battery_power_max_mw
 
+        T_room = state[:, 5:6] * 60.0 - 20.0
+        hvac_required = (T_room < self.comfort_temp_min) | (T_room > self.pre_cooling_temp)
+        p_hvac_electric_kw = torch.where(
+            hvac_required,
+            p_hvac_request_kw,
+            torch.zeros_like(p_hvac_request_kw),
+        )
+
         available_no_building_mw = torch.clamp(state[:, 12:13], min=0.0) * self.p_ez_max_mw
-        building_mw = p_hvac_kw * 1e-3 * self.building_num
+        building_mw = p_hvac_electric_kw * 1e-3 * self.building_num
         available_after_building_mw = torch.clamp(available_no_building_mw - building_mw, min=0.0)
 
         battery_soc_mwh = torch.clamp(state[:, 4:5], 0.0, 1.0) * self.battery_capacity_mwh
@@ -951,7 +1069,7 @@ class FeasibleActionProjector(nn.Module):
         h2_tank_mol = torch.clamp(state[:, 3:4], 0.0, 1.0) * (
             self.h2_max_mol - self.h2_min_mol
         ) + self.h2_min_mol
-        h2_in_mol_h = p_ez_mw * self.ez_efficiency * 1e6 * 3600.0
+        h2_in_mol_h = p_ez_mw * 1000.0 / max(self.h2_electrolyzer_kwh_per_mol, 1e-12)
         ev_h2_out_mol_h = torch.clamp(state[:, 17:18], min=0.0) * self.ev_h2_out_max_mol_h
         bio_external_available_h2_mol_h = torch.clamp(
             h2_tank_mol - ev_h2_out_mol_h + h2_in_mol_h - self.h2_min_mol,
@@ -982,7 +1100,7 @@ class FeasibleActionProjector(nn.Module):
                     -1.0,
                     1.0,
                 ),
-                torch.clamp(2.0 * p_hvac_kw / max(self.p_hvac_max_kw, 1e-6) - 1.0, -1.0, 1.0),
+                torch.clamp(2.0 * p_hvac_electric_kw / max(self.p_hvac_max_kw, 1e-6) - 1.0, -1.0, 1.0),
                 torch.clamp(battery_power_mw / max(self.battery_power_max_mw, 1e-6), -1.0, 1.0),
             ],
             dim=1,
@@ -1090,9 +1208,10 @@ def save_reward_components_csv(save_dir, split_name, records):
         "reward",
         "step_cost",
         "curtail_cost",
+        "comfort_violation_C",
         "comfort_cost_raw",
         "comfort_cost_weighted",
-        "grid_purchase_mwh",
+        "grid_purchase_kwh",
         "grid_co2_emission_t",
         "bio_co2_absorption_t",
         "net_co2_emission_t",
@@ -1100,9 +1219,9 @@ def save_reward_components_csv(save_dir, split_name, records):
         "h2_tank_violation_mol",
         "h2_tank_violation_cost",
         "bio_starvation_cost",
-        "battery_charge_mw",
-        "battery_discharge_mw",
-        "battery_soc_mwh",
+        "battery_charge_kw",
+        "battery_discharge_kw",
+        "battery_soc_kwh",
         "battery_soc_fraction",
         "biomass_reward_component",
         "harvest_reward_component",
@@ -1112,20 +1231,49 @@ def save_reward_components_csv(save_dir, split_name, records):
         writer = csv.writer(f)
         writer.writerow(reward_keys)
         for hour, row in enumerate(records):
-            writer.writerow([hour if key == "hour" else float(row[key]) for key in reward_keys])
+            writer.writerow([
+                hour,
+                float(row["reward"]),
+                float(row["step_cost"]),
+                float(row["curtail_cost"]),
+                float(row.get("comfort_violation_C", 0.0)),
+                float(row["comfort_cost_raw"]),
+                float(row["comfort_cost_weighted"]),
+                float(row["grid_purchase_mwh"]) * 1000.0,
+                float(row["grid_co2_emission_t"]),
+                float(row["bio_co2_absorption_t"]),
+                float(row["net_co2_emission_t"]),
+                float(row["carbon_cost"]),
+                float(row["h2_tank_violation_mol"]),
+                float(row["h2_tank_violation_cost"]),
+                float(row["bio_starvation_cost"]),
+                float(row["battery_charge_mw"]) * 1000.0,
+                float(row["battery_discharge_mw"]) * 1000.0,
+                float(row["battery_soc_mwh"]) * 1000.0,
+                float(row["battery_soc_fraction"]),
+                float(row["biomass_reward_component"]),
+                float(row["harvest_reward_component"]),
+            ])
     return path
 
 
 def save_test_timeseries_details_csv(save_dir, records):
     fields = [
         "time_step",
-        "source_mw",
-        "source_with_battery_mw",
-        "electric_load_mw",
-        "available_h2_power_mw",
-        "p_ez_mw",
-        "grid_purchase_mwh",
-        "p_curtail_mw",
+        "source_kw",
+        "source_with_battery_kw",
+        "electric_load_kw",
+        "building_hvac_electric_kw",
+        "hvac_mode",
+        "p_hvac_request_kw",
+        "p_heat_kw",
+        "p_cool_kw",
+        "p_hvac_electric_kw",
+        "q_hvac",
+        "available_h2_power_kw",
+        "p_ez_kw",
+        "grid_purchase_kwh",
+        "p_curtail_kw",
         "co2_absorbed_mol",
         "co2_absorbed_t",
         "grid_co2_emission_t",
@@ -1145,10 +1293,10 @@ def save_test_timeseries_details_csv(save_dir, records):
         "bio_low_efficiency_replacement_event",
         "bio_severe_h2_shortfall_replacement_event",
         "bio_severe_h2_shortfall_hours",
-        "battery_charge_mw",
-        "battery_discharge_mw",
-        "battery_power_mw",
-        "battery_soc_mwh",
+        "battery_charge_kw",
+        "battery_discharge_kw",
+        "battery_power_kw",
+        "battery_soc_kwh",
         "battery_soc_fraction",
         "h2_tank_mol",
         "h2_tank_violation_mol",
@@ -1176,13 +1324,20 @@ def save_test_timeseries_details_csv(save_dir, records):
             scp_harvested_total = float(row.get("bio_cumulative_harvested_SCP_g_protein", 0.0))
             out = {
                 "time_step": time_step,
-                "source_mw": row.get("source_mw", 0.0),
-                "source_with_battery_mw": row.get("source_with_battery_mw", 0.0),
-                "electric_load_mw": row.get("electric_load_mw", 0.0),
-                "available_h2_power_mw": row.get("available_h2_power_mw", 0.0),
-                "p_ez_mw": row.get("p_ez_mw", 0.0),
-                "grid_purchase_mwh": row.get("grid_purchase_mwh", 0.0),
-                "p_curtail_mw": row.get("p_curtail_mw", 0.0),
+                "source_kw": row.get("source_mw", 0.0) * 1000.0,
+                "source_with_battery_kw": row.get("source_with_battery_mw", 0.0) * 1000.0,
+                "electric_load_kw": row.get("electric_load_mw", 0.0) * 1000.0,
+                "building_hvac_electric_kw": row.get("building_mw", 0.0) * 1000.0,
+                "hvac_mode": row.get("hvac_mode", "off"),
+                "p_hvac_request_kw": row.get("p_hvac_request_kw", 0.0),
+                "p_heat_kw": row.get("p_heat_kw", 0.0),
+                "p_cool_kw": row.get("p_cool_kw", 0.0),
+                "p_hvac_electric_kw": row.get("p_hvac_electric_kw", 0.0),
+                "q_hvac": row.get("q_hvac", 0.0),
+                "available_h2_power_kw": row.get("available_h2_power_mw", 0.0) * 1000.0,
+                "p_ez_kw": row.get("p_ez_mw", 0.0) * 1000.0,
+                "grid_purchase_kwh": row.get("grid_purchase_mwh", 0.0) * 1000.0,
+                "p_curtail_kw": row.get("p_curtail_mw", 0.0) * 1000.0,
                 "co2_absorbed_mol": row.get("bio_co2_uptake_mol", 0.0),
                 "co2_absorbed_t": row.get("bio_co2_absorption_t", 0.0),
                 "grid_co2_emission_t": row.get("grid_co2_emission_t", 0.0),
@@ -1202,10 +1357,10 @@ def save_test_timeseries_details_csv(save_dir, records):
                 "bio_low_efficiency_replacement_event": row.get("bio_low_efficiency_replacement_event", 0.0),
                 "bio_severe_h2_shortfall_replacement_event": row.get("bio_severe_h2_shortfall_replacement_event", 0.0),
                 "bio_severe_h2_shortfall_hours": row.get("bio_severe_h2_shortfall_hours", 0.0),
-                "battery_charge_mw": row.get("battery_charge_mw", 0.0),
-                "battery_discharge_mw": row.get("battery_discharge_mw", 0.0),
-                "battery_power_mw": row.get("battery_power_mw", 0.0),
-                "battery_soc_mwh": row.get("battery_soc_mwh", 0.0),
+                "battery_charge_kw": row.get("battery_charge_mw", 0.0) * 1000.0,
+                "battery_discharge_kw": row.get("battery_discharge_mw", 0.0) * 1000.0,
+                "battery_power_kw": row.get("battery_power_mw", 0.0) * 1000.0,
+                "battery_soc_kwh": row.get("battery_soc_mwh", 0.0) * 1000.0,
                 "battery_soc_fraction": row.get("battery_soc_fraction", 0.0),
                 "h2_tank_mol": row.get("h2_tank_mol", 0.0),
                 "h2_tank_violation_mol": row.get("h2_tank_violation_mol", 0.0),
@@ -1227,24 +1382,23 @@ def save_test_timeseries_details_csv(save_dir, records):
             writer.writerow(out)
     return path
 
-
-EPISODE_REWARD_SUM_KEYS = [
-    "reward",
-    "step_cost",
-    "curtail_cost",
-    "comfort_cost_weighted",
-    "h2_tank_violation_cost",
-    "carbon_cost",
-    "bio_starvation_cost",
-    "biomass_reward_component",
-    "harvest_reward_component",
-    "grid_purchase_mwh",
-    "grid_co2_emission_t",
-    "bio_co2_absorption_t",
-    "net_co2_emission_t",
-    "h2_tank_violation_mol",
-    "battery_charge_mw",
-    "battery_discharge_mw",
+EPISODE_REWARD_SUM_SPECS = [
+    ("reward", "reward", 1.0),
+    ("step_cost", "step_cost", 1.0),
+    ("curtail_cost", "curtail_cost", 1.0),
+    ("comfort_cost_weighted", "comfort_cost_weighted", 1.0),
+    ("h2_tank_violation_cost", "h2_tank_violation_cost", 1.0),
+    ("carbon_cost", "carbon_cost", 1.0),
+    ("bio_starvation_cost", "bio_starvation_cost", 1.0),
+    ("biomass_reward_component", "biomass_reward_component", 1.0),
+    ("harvest_reward_component", "harvest_reward_component", 1.0),
+    ("grid_purchase_kwh", "grid_purchase_mwh", 1000.0),
+    ("grid_co2_emission_t", "grid_co2_emission_t", 1.0),
+    ("bio_co2_absorption_t", "bio_co2_absorption_t", 1.0),
+    ("net_co2_emission_t", "net_co2_emission_t", 1.0),
+    ("h2_tank_violation_mol", "h2_tank_violation_mol", 1.0),
+    ("battery_charge_kw", "battery_charge_mw", 1000.0),
+    ("battery_discharge_kw", "battery_discharge_mw", 1000.0),
 ]
 
 def summarize_epoch_reward_components(episode, split_name, total_reward, records):
@@ -1259,19 +1413,19 @@ def summarize_epoch_reward_components(episode, split_name, total_reward, records
         "mean_reward": float(total_reward) / max(len(records), 1),
         "hours": int(len(records)),
     }
-    for key in EPISODE_REWARD_SUM_KEYS:
-        values = np.asarray([record[key] for record in records], dtype=np.float64)
-        row[f"{key}_sum"] = float(np.sum(values))
-        row[f"{key}_mean"] = float(np.mean(values))
+    for export_key, source_key, scale in EPISODE_REWARD_SUM_SPECS:
+        values = np.asarray([record[source_key] for record in records], dtype=np.float64) * scale
+        row[f"{export_key}_sum"] = float(np.sum(values))
+        row[f"{export_key}_mean"] = float(np.mean(values))
 
     last_record = records[-1]
     row["final_h2_tank_mol"] = float(last_record["h2_tank_mol"])
-    row["final_battery_soc_mwh"] = float(last_record["battery_soc_mwh"])
+    row["final_battery_soc_kwh"] = float(last_record["battery_soc_mwh"]) * 1000.0
     row["final_battery_soc_fraction"] = float(last_record["battery_soc_fraction"])
     row["mean_bio_H2_growth_fraction"] = float(np.mean([r["bio_H2_growth_fraction"] for r in records]))
     row["mean_bio_starvation_level"] = float(np.mean([r["bio_starvation_level"] for r in records]))
-    row["mean_p_ez_mw"] = float(np.mean([r["p_ez_mw"] for r in records]))
-    row["mean_grid_purchase_mwh"] = float(np.mean([r["grid_purchase_mwh"] for r in records]))
+    row["mean_p_ez_kw"] = float(np.mean([r["p_ez_mw"] for r in records])) * 1000.0
+    row["mean_grid_purchase_kwh"] = float(np.mean([r["grid_purchase_mwh"] for r in records])) * 1000.0
     return row
 
 
@@ -1343,7 +1497,7 @@ def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
     full_data = load_scenario_data(configs)
     source_load_csv_path = os.path.join(save_dir, "source_load_match.csv")
     full_data, energy_summary = match_source_to_load_ratio(
-        full_data, configs, bio_h2_feed_max_mol_h=4.0, csv_path=source_load_csv_path
+        full_data, configs, bio_h2_feed_max_mol_h=5000.0, csv_path=source_load_csv_path
     )
     split_data, split_lengths = split_scenario_data(full_data)
     print(
@@ -1362,6 +1516,7 @@ def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
     train_data = split_data["train"]
     test_data = split_data["test"]
     validation_data = split_data["validation"]
+    norm_stats = build_norm_stats(train_data)
 
     env = MicrogridBioTD3Env(
         configs,
@@ -1371,6 +1526,7 @@ def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
         train_data.ev_demand,
         train_data.t_out,
         train_data.irradiance,
+        norm_stats=norm_stats,
     )
     validation_env = MicrogridBioTD3Env(
         configs,
@@ -1380,6 +1536,7 @@ def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
         validation_data.ev_demand,
         validation_data.t_out,
         validation_data.irradiance,
+        norm_stats=norm_stats,
     )
     test_env = MicrogridBioTD3Env(
         configs,
@@ -1389,6 +1546,7 @@ def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
         test_data.ev_demand,
         test_data.t_out,
         test_data.irradiance,
+        norm_stats=norm_stats,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1397,10 +1555,13 @@ def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
         bio_h2_feed_max_mol_h=env.bio_h2_feed_max_mol_h,
         p_hvac_max_kw=env.p_hvac_max_kw,
         building_num=configs.building_num,
+        comfort_temp_min=env.building.comfort_temp_min,
+        comfort_temp_max=env.building.comfort_temp_max,
+        pre_cooling_temp=env.building.pre_cooling_temp,
         battery_capacity_mwh=env.battery_capacity_mwh,
         battery_power_max_mw=env.battery_power_max_mw,
         battery_efficiency=env.battery_efficiency,
-        ez_efficiency=env.ez_efficiency,
+        h2_electrolyzer_kwh_per_mol=env.h2_electrolyzer_kwh_per_mol,
         h2_min_mol=env.h2_min,
         h2_max_mol=env.h2_max,
         ev_h2_out_max_mol_h=env.ev_h2_out_max_mol_h,
@@ -1418,6 +1579,25 @@ def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
     best_records = None
 
     for episode in range(1, td3_cfg.episodes + 1):
+        window_start = 0
+        window_hours = len(train_data.pv)
+        if td3_cfg.random_train_window:
+            window_hours = int(td3_cfg.episode_window_hours)
+            if window_hours <= 0:
+                raise ValueError("episode_window_hours must be > 0")
+            if window_hours > len(train_data.pv):
+                raise ValueError(
+                    "episode_window_hours cannot exceed the training set length."
+                )
+            max_start = len(train_data.pv) - window_hours
+            window_start = int(np.random.randint(0, max_start + 1))
+            train_episode_data = slice_scenario_window(
+                train_data, window_start, window_hours
+            )
+            env.set_scenario_data(train_episode_data)
+        else:
+            env.set_scenario_data(train_data)
+
         state = env.reset()
         done = False
         total_reward = 0.0
@@ -1453,12 +1633,12 @@ def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
             best_records = validation_records
             torch.save(agent.actor.state_dict(), os.path.join(save_dir, "actor_best.pth"))
 
-        if episode == 1 or episode % 10 == 0:
-            print(
-                f"Episode {episode:04d} | train_reward={total_reward:.3f} "
-                f"| test_reward={test_epoch_reward:.3f} "
-                f"| validation_reward={validation_reward:.3f} | noise={noise_std:.3f}"
-            )
+        print(
+            f"Episode {episode:04d} | window_start={window_start} "
+            f"| window_hours={window_hours} | train_reward={total_reward:.3f} "
+            f"| test_reward={test_epoch_reward:.3f} "
+            f"| validation_reward={validation_reward:.3f} | noise={noise_std:.3f}"
+        )
 
     if best_records is None:
         best_reward, best_records = evaluate_policy(validation_env, agent)
@@ -1467,6 +1647,7 @@ def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
     if os.path.exists(best_actor_path):
         agent.actor.load_state_dict(torch.load(best_actor_path, map_location=device))
 
+    env.set_scenario_data(train_data)
     train_reward, train_records = evaluate_policy(env, agent)
     validation_reward, validation_records = evaluate_policy(validation_env, agent)
     test_reward, test_records = evaluate_policy(test_env, agent)
@@ -1500,13 +1681,24 @@ def run_td3_optimization(configs, td3_cfg=None, save_dir=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Solve the microgrid plus HOB-SCP bio-load scenario with TD3.")
-    parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--episodes", type=int, default=4000)
     parser.add_argument("--seed", type=int, default=8)
+    parser.add_argument("--episode-window-hours", type=int, default=72)
+    parser.add_argument(
+        "--no-random-train-window",
+        action="store_true",
+        help="Use the full training split for every episode instead of random windows.",
+    )
     parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "TD3_result"))
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    cfg = TD3Config(episodes=args.episodes, seed=args.seed)
+    cfg = TD3Config(
+        episodes=args.episodes,
+        seed=args.seed,
+        random_train_window=not args.no_random_train_window,
+        episode_window_hours=args.episode_window_hours,
+    )
     run_td3_optimization(Configs(), cfg, args.save_dir)

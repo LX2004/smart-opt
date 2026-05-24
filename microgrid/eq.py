@@ -194,11 +194,53 @@ class smart_building():
         # self.c = 314.7
         self.Gi_solar = 0.5
         self.COP = 3
+        self.COP_heating = 3.0
+        self.COP_cooling = 3.0
+        self.comfort_temp_min = 22.0
+        self.comfort_temp_max = 26.0
+        self.pre_cooling_temp = 24.0
         self.r1 = 0.116
         self.r2 = 0.116
         self.rwind = 3
         self.czone = 500
         self.c = 100
+
+    def split_hvac_power(self, T_room, requested_power_kw):
+        requested_power_kw = max(float(requested_power_kw), 0.0)
+        if T_room > self.comfort_temp_max:
+            return {
+                "mode": "cooling",
+                "p_heat_kw": 0.0,
+                "p_cool_kw": requested_power_kw,
+                "p_hvac_electric_kw": requested_power_kw,
+            }
+        if T_room > self.pre_cooling_temp:
+            return {
+                "mode": "pre_cooling",
+                "p_heat_kw": 0.0,
+                "p_cool_kw": requested_power_kw,
+                "p_hvac_electric_kw": requested_power_kw,
+            }
+        if T_room < self.comfort_temp_min:
+            return {
+                "mode": "heating",
+                "p_heat_kw": requested_power_kw,
+                "p_cool_kw": 0.0,
+                "p_hvac_electric_kw": requested_power_kw,
+            }
+        return {
+            "mode": "off",
+            "p_heat_kw": 0.0,
+            "p_cool_kw": 0.0,
+            "p_hvac_electric_kw": 0.0,
+        }
+
+    def comfort_violation(self, T_room):
+        if T_room < self.comfort_temp_min:
+            return self.comfort_temp_min - T_room
+        if T_room > self.comfort_temp_max:
+            return T_room - self.comfort_temp_max
+        return 0.0
     
 class bio_factory():
     def __init__(self):

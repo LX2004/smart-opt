@@ -52,7 +52,7 @@ class Configs:
 
 
 @dataclass
-class SACConfig:
+class DDPGConfig:
     episodes: int = 120
     batch_size: int = 256
     buffer_size: int = 200000
@@ -61,17 +61,21 @@ class SACConfig:
     actor_lr: float = 1e-4
     critic_lr: float = 1e-3
     hidden_dim: int = 256
-    exploration_noise: float = 1.0
-    noise_decay: float = 1.0
-    min_noise: float = 1.0
-    alpha_lr: float = 3e-4
-    init_alpha: float = 0.2
-    target_entropy: float = -4.0
-    log_std_min: float = -20.0
-    log_std_max: float = 2.0
+    exploration_noise: float = 0.15
+    noise_decay: float = 0.995
+    min_noise: float = 0.02
     seed: int = 8
     random_train_window: bool = True
     episode_window_hours: int = 72
+    use_multi_candidate_action: bool = True
+    num_action_candidates: int = 8
+    candidate_noise_std: float = 0.10
+    candidate_noise_decay: float = 0.995
+    candidate_min_noise_std: float = 0.02
+    use_entropy_candidate_sampling: bool = False
+    entropy_alpha: float = 0.20
+    entropy_alpha_decay: float = 0.995
+    entropy_min_alpha: float = 0.03
 
 
 @dataclass
@@ -98,7 +102,7 @@ class FixedStrainHydrogenLoad:
         fixed_X0_gdw=100.0,
         h2_growth_fraction_cutoff=0.5,
         min_runtime_before_replacement_h=24.0,
-        physical_h2_feed_max_mol_h=5000.0,
+        physical_h2_feed_max_mol_h=4000.0,
         severe_h2_shortfall_cutoff_h=6.0,
     ):
         self.fixed_X0_gdw = float(fixed_X0_gdw)
@@ -519,7 +523,7 @@ def plot_bio_microgrid_results(
     print(f"结果图片已成功保存至: {save_path}")
 
 
-class MicrogridBioSACEnv:
+class MicrogridBioDDPGEnv:
     def __init__(
         self,
         configs,
@@ -927,13 +931,10 @@ class ReplayBuffer:
         )
 
 
-
-class GaussianPolicy(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim, log_std_min=-20.0, log_std_max=2.0):
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim):
         super().__init__()
-        self.log_std_min = float(log_std_min)
-        self.log_std_max = float(log_std_max)
-        self.trunk = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(state_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 128),
@@ -944,40 +945,18 @@ class GaussianPolicy(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
+            nn.Linear(64, action_dim),
+            nn.Tanh(),
         )
-        self.mean = nn.Linear(64, action_dim)
-        self.log_std = nn.Linear(64, action_dim)
 
     def forward(self, state):
-        x = self.trunk(state)
-        mean = self.mean(x)
-        log_std = torch.clamp(self.log_std(x), self.log_std_min, self.log_std_max)
-        return mean, log_std
-
-    def sample(self, state):
-        mean, log_std = self.forward(state)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
-        z = normal.rsample()
-        action = torch.tanh(z)
-        log_prob = normal.log_prob(z) - torch.log(1.0 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(dim=-1, keepdim=True)
-        return action, log_prob
-
-    def deterministic(self, state):
-        mean, _ = self.forward(state)
-        return torch.tanh(mean)
+        return self.net(state)
 
 
-class TwinQNetwork(nn.Module):
+class Critic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim):
         super().__init__()
-        self.q1 = self._make_q_network(state_dim, action_dim)
-        self.q2 = self._make_q_network(state_dim, action_dim)
-
-    @staticmethod
-    def _make_q_network(state_dim, action_dim):
-        return nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 128),
@@ -992,10 +971,10 @@ class TwinQNetwork(nn.Module):
         )
 
     def forward(self, state, action):
-        state_action = torch.cat([state, action], dim=-1)
-        return self.q1(state_action), self.q2(state_action)
+        return self.net(torch.cat([state, action], dim=-1))
 
-class FeasibleActionProjector(nn.Module):
+
+class SafetyProjectionLayer(nn.Module):
     def __init__(
         self,
         p_ez_max_mw,
@@ -1125,77 +1104,120 @@ class FeasibleActionProjector(nn.Module):
         return projected
 
 
-class SACAgent:
-    def __init__(self, state_dim, action_dim, cfg, device, action_projector=None):
+class DDPGAgent:
+    def __init__(self, state_dim, action_dim, cfg, device, safety_projection_layer=None):
         self.cfg = cfg
         self.device = device
-        self.action_projector = action_projector
-        self.actor = GaussianPolicy(
-            state_dim,
-            action_dim,
-            cfg.hidden_dim,
-            log_std_min=cfg.log_std_min,
-            log_std_max=cfg.log_std_max,
-        ).to(device)
-        self.critic = TwinQNetwork(state_dim, action_dim, cfg.hidden_dim).to(device)
-        self.critic_target = TwinQNetwork(state_dim, action_dim, cfg.hidden_dim).to(device)
+        self.safety_projection_layer = safety_projection_layer
+        self.actor = Actor(state_dim, action_dim, cfg.hidden_dim).to(device)
+        self.actor_target = Actor(state_dim, action_dim, cfg.hidden_dim).to(device)
+        self.critic = Critic(state_dim, action_dim, cfg.hidden_dim).to(device)
+        self.critic_target = Critic(state_dim, action_dim, cfg.hidden_dim).to(device)
+        self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
-        self.log_alpha = torch.tensor(
-            np.log(cfg.init_alpha), dtype=torch.float32, device=device, requires_grad=True
-        )
-        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=cfg.alpha_lr)
-        self.target_entropy = float(cfg.target_entropy)
 
-    @property
-    def alpha(self):
-        return self.log_alpha.exp()
+    def select_action_multi_candidate(
+        self,
+        state,
+        candidate_noise_std=0.10,
+        num_candidates=8,
+        entropy_alpha=None,
+    ):
+        state_tensor = torch.as_tensor(
+            state, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+        num_candidates = max(int(num_candidates), 1)
+        candidate_noise_std = max(float(candidate_noise_std), 0.0)
 
-    def select_action(self, state, noise_std=0.0):
+        with torch.no_grad():
+            center_action = torch.clamp(self.actor(state_tensor), -1.0, 1.0)
+            candidates = [center_action]
+            for _ in range(num_candidates - 1):
+                noise = torch.randn_like(center_action) * candidate_noise_std
+                candidate = torch.clamp(center_action + noise, -1.0, 1.0)
+                candidates.append(candidate)
+            candidates = torch.cat(candidates, dim=0)
+            repeated_states = state_tensor.repeat(num_candidates, 1)
+
+            if self.safety_projection_layer is not None:
+                candidates_safe = self.safety_projection_layer(repeated_states, candidates)
+            else:
+                candidates_safe = torch.clamp(candidates, -1.0, 1.0)
+
+            q_values = self.critic(repeated_states, candidates_safe).squeeze(-1)
+            if entropy_alpha is None:
+                selected_idx = int(torch.argmax(q_values).item())
+            else:
+                alpha = max(float(entropy_alpha), 1e-8)
+                probs = torch.softmax(q_values / alpha, dim=0)
+                selected_idx = int(torch.multinomial(probs, num_samples=1).item())
+            action = candidates_safe[selected_idx]
+
+        return torch.clamp(action, -1.0, 1.0).cpu().numpy().astype(np.float32)
+
+    def select_action(
+        self,
+        state,
+        noise_std=0.0,
+        num_candidates=None,
+        candidate_noise_std=None,
+        entropy_alpha=None,
+    ):
+        if num_candidates is None:
+            num_candidates = getattr(self.cfg, "num_action_candidates", 1)
+        if candidate_noise_std is None:
+            candidate_noise_std = getattr(self.cfg, "candidate_noise_std", 0.10)
+
+        if (
+            getattr(self.cfg, "use_multi_candidate_action", False)
+            and int(num_candidates) > 1
+        ):
+            return self.select_action_multi_candidate(
+                state,
+                candidate_noise_std=candidate_noise_std,
+                num_candidates=num_candidates,
+                entropy_alpha=entropy_alpha,
+            )
+
         state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            if noise_std > 0:
-                action, _ = self.actor.sample(state_tensor)
-            else:
-                action = self.actor.deterministic(state_tensor)
-            action = self.project_action(state_tensor, action)
-        return np.clip(action.cpu().numpy()[0], -1.0, 1.0).astype(np.float32)
+            action = self.actor(state_tensor).cpu().numpy()[0]
+        if noise_std > 0:
+            action = action + np.random.normal(0.0, noise_std, size=action.shape)
+        action = np.clip(action, -1.0, 1.0).astype(np.float32)
+        if self.safety_projection_layer is not None:
+            action_tensor = torch.as_tensor(action, dtype=torch.float32, device=self.device).unsqueeze(0)
+            with torch.no_grad():
+                action = self.safety_projection_layer(state_tensor, action_tensor).cpu().numpy()[0]
+        return np.clip(action, -1.0, 1.0).astype(np.float32)
 
     def project_action(self, states, actions):
-        if self.action_projector is None:
+        if self.safety_projection_layer is None:
             return torch.clamp(actions, -1.0, 1.0)
-        return self.action_projector(states, actions)
+        return self.safety_projection_layer(states, actions)
 
     def learn(self, replay_buffer):
         states, actions, rewards, next_states, dones = replay_buffer.sample(self.cfg.batch_size)
         with torch.no_grad():
-            next_raw_actions, next_log_prob = self.actor.sample(next_states)
-            next_actions = self.project_action(next_states, next_raw_actions)
-            target_q1, target_q2 = self.critic_target(next_states, next_actions)
-            target_q = torch.minimum(target_q1, target_q2) - self.alpha.detach() * next_log_prob
+            next_actions = self.project_action(next_states, self.actor_target(next_states))
+            target_q = self.critic_target(next_states, next_actions)
             target = rewards + self.cfg.gamma * (1.0 - dones) * target_q
 
-        current_q1, current_q2 = self.critic(states, actions)
-        critic_loss = F.mse_loss(current_q1, target) + F.mse_loss(current_q2, target)
+        current_q = self.critic(states, actions)
+        critic_loss = F.mse_loss(current_q, target)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        raw_actions, log_prob = self.actor.sample(states)
-        actor_actions = self.project_action(states, raw_actions)
-        q1_pi, q2_pi = self.critic(states, actor_actions)
-        min_q_pi = torch.minimum(q1_pi, q2_pi)
-        actor_loss = (self.alpha.detach() * log_prob - min_q_pi).mean()
+        actor_actions = self.project_action(states, self.actor(states))
+        actor_loss = -self.critic(states, actor_actions).mean()
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
 
-        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
-
+        self._soft_update(self.actor_target, self.actor)
         self._soft_update(self.critic_target, self.critic)
         return float(actor_loss.item()), float(critic_loss.item())
 
@@ -1211,7 +1233,13 @@ def evaluate_policy(env, agent):
     done = False
     total_reward = 0.0
     while not done:
-        action = agent.select_action(state, noise_std=0.0)
+        action = agent.select_action(
+            state,
+            noise_std=0.0,
+            num_candidates=getattr(agent.cfg, "num_action_candidates", 1),
+            candidate_noise_std=getattr(agent.cfg, "candidate_min_noise_std", 0.0),
+            entropy_alpha=None,
+        )
         state, reward, done, _ = env.step(action)
         total_reward += reward
     return total_reward, list(env.records)
@@ -1495,7 +1523,7 @@ def save_split_results(save_dir, split_name, scenario, records, reward, episode_
     }
     if episode_rewards is not None:
         payload["episode_rewards"] = np.asarray(episode_rewards, dtype=np.float32)
-    np.savez(os.path.join(save_dir, f"sac_microgrid_{split_name}_results.npz"), **payload)
+    np.savez(os.path.join(save_dir, f"mcsa_spddpg_microgrid_{split_name}_results.npz"), **payload)
     plot_bio_microgrid_results(
         scenario.pv,
         scenario.wind,
@@ -1509,16 +1537,16 @@ def save_split_results(save_dir, split_name, scenario, records, reward, episode_
         result["T_room"],
         scenario.t_out,
         result["T_wall"],
-        save_path=os.path.join(save_dir, f"SAC_{split_name}_overall_strategy.png"),
+        save_path=os.path.join(save_dir, f"MCSA_SPDDPG_{split_name}_overall_strategy.png"),
     )
     return result
 
 
-def run_sac_optimization(configs, sac_cfg=None, save_dir=None):
-    sac_cfg = sac_cfg or SACConfig()
-    save_dir = save_dir or os.path.join(BASE_DIR, "SAC_result")
+def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
+    ddpg_cfg = ddpg_cfg or DDPGConfig()
+    save_dir = save_dir or os.path.join(BASE_DIR, "MCSA_SPDDPG_result")
     os.makedirs(save_dir, exist_ok=True)
-    set_seed(sac_cfg.seed)
+    set_seed(ddpg_cfg.seed)
 
     full_data = load_scenario_data(configs)
     source_load_csv_path = os.path.join(save_dir, "source_load_match.csv")
@@ -1544,7 +1572,7 @@ def run_sac_optimization(configs, sac_cfg=None, save_dir=None):
     validation_data = split_data["validation"]
     norm_stats = build_norm_stats(train_data)
 
-    env = MicrogridBioSACEnv(
+    env = MicrogridBioDDPGEnv(
         configs,
         train_data.pv,
         train_data.wind,
@@ -1554,7 +1582,7 @@ def run_sac_optimization(configs, sac_cfg=None, save_dir=None):
         train_data.irradiance,
         norm_stats=norm_stats,
     )
-    validation_env = MicrogridBioSACEnv(
+    validation_env = MicrogridBioDDPGEnv(
         configs,
         validation_data.pv,
         validation_data.wind,
@@ -1564,7 +1592,7 @@ def run_sac_optimization(configs, sac_cfg=None, save_dir=None):
         validation_data.irradiance,
         norm_stats=norm_stats,
     )
-    test_env = MicrogridBioSACEnv(
+    test_env = MicrogridBioDDPGEnv(
         configs,
         test_data.pv,
         test_data.wind,
@@ -1576,7 +1604,7 @@ def run_sac_optimization(configs, sac_cfg=None, save_dir=None):
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    action_projector = FeasibleActionProjector(
+    safety_projection_layer = SafetyProjectionLayer(
         p_ez_max_mw=env.p_ez_max_mw,
         bio_h2_feed_max_mol_h=env.bio_h2_feed_max_mol_h,
         p_hvac_max_kw=env.p_hvac_max_kw,
@@ -1593,22 +1621,22 @@ def run_sac_optimization(configs, sac_cfg=None, save_dir=None):
         ev_h2_out_max_mol_h=env.ev_h2_out_max_mol_h,
         q_h2_hydrogenase_cap=env.bio_load.params.q_h2_hydrogenase_cap,
     ).to(device)
-    agent = SACAgent(env.state_dim, env.action_dim, sac_cfg, device, action_projector)
-    replay_buffer = ReplayBuffer(sac_cfg.buffer_size, env.state_dim, env.action_dim, device)
+    agent = DDPGAgent(env.state_dim, env.action_dim, ddpg_cfg, device, safety_projection_layer)
+    replay_buffer = ReplayBuffer(ddpg_cfg.buffer_size, env.state_dim, env.action_dim, device)
 
     episode_rewards = []
     epoch_train_reward_rows = []
     epoch_test_reward_rows = []
     epoch_all_reward_rows = []
-    noise_std = sac_cfg.exploration_noise
+    noise_std = ddpg_cfg.exploration_noise
     best_reward = -np.inf
     best_records = None
 
-    for episode in range(1, sac_cfg.episodes + 1):
+    for episode in range(1, ddpg_cfg.episodes + 1):
         window_start = 0
         window_hours = len(train_data.pv)
-        if sac_cfg.random_train_window:
-            window_hours = int(sac_cfg.episode_window_hours)
+        if ddpg_cfg.random_train_window:
+            window_hours = int(ddpg_cfg.episode_window_hours)
             if window_hours <= 0:
                 raise ValueError("episode_window_hours must be > 0")
             if window_hours > len(train_data.pv):
@@ -1624,16 +1652,36 @@ def run_sac_optimization(configs, sac_cfg=None, save_dir=None):
         else:
             env.set_scenario_data(train_data)
 
+        candidate_noise_std = max(
+            ddpg_cfg.candidate_min_noise_std,
+            ddpg_cfg.candidate_noise_std
+            * (ddpg_cfg.candidate_noise_decay ** episode),
+        )
+        entropy_alpha = max(
+            ddpg_cfg.entropy_min_alpha,
+            ddpg_cfg.entropy_alpha * (ddpg_cfg.entropy_alpha_decay ** episode),
+        )
+        if not ddpg_cfg.use_entropy_candidate_sampling:
+            entropy_alpha_for_action = None
+        else:
+            entropy_alpha_for_action = entropy_alpha
+
         state = env.reset()
         done = False
         total_reward = 0.0
         while not done:
-            action = agent.select_action(state, noise_std=noise_std)
+            action = agent.select_action(
+                state,
+                noise_std=noise_std,
+                num_candidates=ddpg_cfg.num_action_candidates,
+                candidate_noise_std=candidate_noise_std,
+                entropy_alpha=entropy_alpha_for_action,
+            )
             next_state, reward, done, info = env.step(action)
             replay_buffer.store(state, info["executed_action"], reward, next_state, float(done))
             state = next_state
             total_reward += reward
-            if replay_buffer.size >= sac_cfg.batch_size:
+            if replay_buffer.size >= ddpg_cfg.batch_size:
                 agent.learn(replay_buffer)
 
         episode_rewards.append(total_reward)
@@ -1652,7 +1700,7 @@ def run_sac_optimization(configs, sac_cfg=None, save_dir=None):
         write_epoch_reward_history_csv(save_dir, "test", epoch_test_reward_rows)
         write_combined_epoch_reward_history_csv(save_dir, epoch_all_reward_rows)
 
-        noise_std = max(sac_cfg.min_noise, noise_std * sac_cfg.noise_decay)
+        noise_std = max(ddpg_cfg.min_noise, noise_std * ddpg_cfg.noise_decay)
         validation_reward, validation_records = evaluate_policy(validation_env, agent)
         if validation_reward > best_reward:
             best_reward = validation_reward
@@ -1687,7 +1735,7 @@ def run_sac_optimization(configs, sac_cfg=None, save_dir=None):
     test_result = save_split_results(save_dir, "test", test_data, test_records, test_reward)
 
     np.savez(
-        os.path.join(save_dir, "sac_split_summary.npz"),
+        os.path.join(save_dir, "mcsa_spddpg_split_summary.npz"),
         train_hours=np.asarray([split_lengths["train"]], dtype=np.int32),
         test_hours=np.asarray([split_lengths["test"]], dtype=np.int32),
         validation_hours=np.asarray([split_lengths["validation"]], dtype=np.int32),
@@ -1706,7 +1754,7 @@ def run_sac_optimization(configs, sac_cfg=None, save_dir=None):
     return {"train": train_result, "validation": validation_result, "test": test_result}, episode_rewards
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Solve the microgrid plus HOB-SCP bio-load scenario with SAC.")
+    parser = argparse.ArgumentParser(description="Solve the microgrid plus HOB-SCP bio-load scenario with DDPG.")
     parser.add_argument("--episodes", type=int, default=4000)
     parser.add_argument("--seed", type=int, default=8)
     parser.add_argument("--episode-window-hours", type=int, default=72)
@@ -1715,16 +1763,16 @@ def parse_args():
         action="store_true",
         help="Use the full training split for every episode instead of random windows.",
     )
-    parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "SAC_result"))
+    parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "MCSA_SPDDPG_result"))
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    cfg = SACConfig(
+    cfg = DDPGConfig(
         episodes=args.episodes,
         seed=args.seed,
         random_train_window=not args.no_random_train_window,
         episode_window_hours=args.episode_window_hours,
     )
-    run_sac_optimization(Configs(), cfg, args.save_dir)
+    run_ddpg_optimization(Configs(), cfg, args.save_dir)
