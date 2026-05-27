@@ -34,7 +34,7 @@ class Configs:
         self.hydrogen_tank_max_pressure = 35.0
         self.h2_tank_mol_min = 4e3
         self.h2_tank_mol_max = 6e4
-        self.h2_tank_num = 400
+        self.h2_tank_num = 40
 
         self.num_cell = 2e3
         self.area = 1000
@@ -42,7 +42,7 @@ class Configs:
         self.ev2fcev_ratio_mol = 200.0
         self.h2_electrolyzer_kwh_per_mol = 0.1135
         self.human_comfort_temp = 24
-        self.building_num = 10
+        self.building_num = 2
         self.wind_turbine_num = 100
         self.source_to_load_ratio = 1.3
         self.ev_to_bio_h2_ratio = 0.2
@@ -58,8 +58,8 @@ class DDPGConfig:
     buffer_size: int = 200000
     gamma: float = 0.99
     tau: float = 0.005
-    actor_lr: float = 1e-4
-    critic_lr: float = 1e-3
+    actor_lr: float = 1e-5
+    critic_lr: float = 1e-4
     hidden_dim: int = 256
     exploration_noise: float = 0.15
     noise_decay: float = 0.995
@@ -557,11 +557,18 @@ class MicrogridBioDDPGEnv:
         self.bio_h2_feed_max_mol_h = self.bio_load.physical_h2_feed_max_mol_h()
         self.bio_o2_ratio = 0.40
         self.bio_co2_ratio = 0.125
-        self.biomass_reward_weight = 2.0
-        self.harvest_reward_weight = 2.0
-        self.bio_starvation_penalty_weight = 20.0
-        self.bio_forced_replacement_penalty_weight = 200.0
-        self.carbon_penalty_weight = 1.0
+
+        self.dispatch_time_step_h = 1.0
+        self.reward_scale_yuan = 1000.0
+        self.curtail_price_yuan_per_kwh = 1.0
+        self.grid_price_yuan_per_kwh = 1.0
+        self.carbon_price_yuan_per_tco2 = 577.0
+        self.scp_price_yuan_per_kg_protein = 12.0
+        self.h2_violation_penalty_yuan = 1000.0
+        self.battery_violation_penalty_yuan = 1000.0
+        self.comfort_violation_penalty_yuan = 1000.0
+        self.bio_forced_replacement_penalty_yuan = 2000.0
+        self.bio_h2_violation_penalty_yuan = 1000.0
         self.battery_capacity_mwh = 2.0
         self.battery_power_max_mw = 2.0
         self.battery_efficiency = 0.9
@@ -603,10 +610,31 @@ class MicrogridBioDDPGEnv:
         return max(0.0, source_mw - electric_load_mw)
 
     def _apply_battery_command(self, command_mw, charge_power_limit_mw=None):
-        command_mw = float(np.clip(command_mw, -self.battery_power_max_mw, self.battery_power_max_mw))
+        requested_command_mw = float(command_mw)
+        command_mw = float(np.clip(requested_command_mw, -self.battery_power_max_mw, self.battery_power_max_mw))
         soc_before = self.battery_soc_mwh
         charge_mw = 0.0
         discharge_mw = 0.0
+
+        battery_power_limit_violation_mw = max(
+            0.0, abs(requested_command_mw) - self.battery_power_max_mw
+        )
+        if command_mw >= 0.0:
+            requested_soc_after = soc_before - command_mw / self.battery_efficiency
+        else:
+            requested_soc_after = soc_before + (-command_mw) * self.battery_efficiency
+        requested_soc_fraction_after = requested_soc_after / max(self.battery_capacity_mwh, 1e-12)
+        battery_soc_lower_violation_mwh = max(0.0, -requested_soc_after)
+        battery_soc_upper_violation_mwh = max(0.0, requested_soc_after - self.battery_capacity_mwh)
+        battery_soc_violation_mwh = (
+            battery_soc_lower_violation_mwh + battery_soc_upper_violation_mwh
+        )
+        battery_soc_lower_violation_event = battery_soc_lower_violation_mwh > 1e-9
+        battery_soc_upper_violation_event = battery_soc_upper_violation_mwh > 1e-9
+        battery_soc_violation_event = (
+            battery_soc_lower_violation_event or battery_soc_upper_violation_event
+        )
+        battery_violation_event = battery_soc_violation_event
 
         if command_mw >= 0.0:
             discharge_mw = min(
@@ -627,6 +655,7 @@ class MicrogridBioDDPGEnv:
 
         self.battery_soc_mwh = float(np.clip(self.battery_soc_mwh, 0.0, self.battery_capacity_mwh))
         return {
+            "battery_requested_command_mw": requested_command_mw,
             "battery_command_mw": command_mw,
             "battery_charge_mw": float(charge_mw),
             "battery_discharge_mw": float(discharge_mw),
@@ -634,6 +663,15 @@ class MicrogridBioDDPGEnv:
             "battery_soc_before_mwh": float(soc_before),
             "battery_soc_mwh": float(self.battery_soc_mwh),
             "battery_soc_fraction": float(self.battery_soc_mwh / max(self.battery_capacity_mwh, 1e-6)),
+            "battery_power_limit_violation_mw": float(battery_power_limit_violation_mw),
+            "battery_requested_soc_fraction_after": float(requested_soc_fraction_after),
+            "battery_soc_lower_violation_mwh": float(battery_soc_lower_violation_mwh),
+            "battery_soc_upper_violation_mwh": float(battery_soc_upper_violation_mwh),
+            "battery_soc_violation_mwh": float(battery_soc_violation_mwh),
+            "battery_soc_lower_violation_event": float(battery_soc_lower_violation_event),
+            "battery_soc_upper_violation_event": float(battery_soc_upper_violation_event),
+            "battery_soc_violation_event": float(battery_soc_violation_event),
+            "battery_violation_event": float(battery_violation_event),
         }
 
     def _state(self):
@@ -763,9 +801,10 @@ class MicrogridBioDDPGEnv:
         demand = electric_load_mw + battery["battery_charge_mw"] + p_ez_mw
         surplus = supply_with_battery_mw - demand
         curtail_mw = max(surplus, 0.0)
-        grid_purchase_mwh = max(-surplus, 0.0)
+        grid_purchase_mwh = max(-surplus, 0.0) * self.dispatch_time_step_h
 
         bio_min_survival_h2_mol_h = self.bio_load.minimum_survival_h2_mol_h()
+        bio_max_demand_h2_mol_h = self.bio_load.biological_h2_absorption_max_mol_h()
         h2_in_mol_h = p_ez_mw * 1000.0 / max(self.h2_electrolyzer_kwh_per_mol, 1e-12)
         ev_h2_out_mol_h = float(self.ev_h2_out_mol_h[idx])
         h2_after_ev_mol = self.h2_tank_mol - ev_h2_out_mol_h
@@ -777,7 +816,9 @@ class MicrogridBioDDPGEnv:
         bio_h2_feed_mol_h = bio_h2_limit_info["H2_actual_feed_mol_h"]
         bio = self._bio_step(bio_h2_feed_mol_h, available_h2_mol_h=bio_available_h2_mol_h)
         next_h2 = h2_after_ev_mol + h2_in_mol_h - bio["bio_h2_uptake_mol"]
-        h2_violation = max(self.h2_min - next_h2, 0.0) + max(next_h2 - self.h2_max, 0.0)
+        h2_lower_violation_mol = max(self.h2_min - next_h2, 0.0)
+        h2_upper_violation_mol = max(next_h2 - self.h2_max, 0.0)
+        h2_violation = h2_lower_violation_mol + h2_upper_violation_mol
         self.h2_tank_mol = float(np.clip(next_h2, self.h2_min, self.h2_max))
         executed_action = self._physical_to_action(
             p_ez_mw,
@@ -802,31 +843,136 @@ class MicrogridBioDDPGEnv:
 
         comfort_violation = self.building.comfort_violation(self.T_in)
         comfort_cost = comfort_violation**2
-        weighted_comfort_cost = 0.1 * comfort_cost
-        h2_cost = 1e-8 * h2_violation**2
+        comfort_violation_event = bool(comfort_violation > 1e-9)
+
+        curtail_mwh = curtail_mw * self.dispatch_time_step_h
+        curtail_cost_yuan = (
+            curtail_mwh * 1000.0 * self.curtail_price_yuan_per_kwh
+        )
+        grid_purchase_cost_yuan = (
+            grid_purchase_mwh * 1000.0 * self.grid_price_yuan_per_kwh
+        )
+
+        h2_lower_violation_event = bool(h2_lower_violation_mol > 1e-9)
+        h2_upper_violation_event = bool(h2_upper_violation_mol > 1e-9)
+        h2_violation_event = h2_lower_violation_event or h2_upper_violation_event
+        h2_lower_violation_cost_yuan = (
+            self.h2_violation_penalty_yuan if h2_lower_violation_event else 0.0
+        )
+        h2_upper_violation_cost_yuan = (
+            self.h2_violation_penalty_yuan if h2_upper_violation_event else 0.0
+        )
+        h2_violation_cost_yuan = (
+            h2_lower_violation_cost_yuan + h2_upper_violation_cost_yuan
+        )
+        comfort_violation_cost_yuan = (
+            self.comfort_violation_penalty_yuan if comfort_violation_event else 0.0
+        )
+        battery_soc_lower_violation_event = bool(
+            battery["battery_soc_lower_violation_event"] > 0.5
+        )
+        battery_soc_upper_violation_event = bool(
+            battery["battery_soc_upper_violation_event"] > 0.5
+        )
+        battery_soc_violation_event = (
+            battery_soc_lower_violation_event or battery_soc_upper_violation_event
+        )
+        battery_soc_lower_violation_cost_yuan = (
+            self.battery_violation_penalty_yuan
+            if battery_soc_lower_violation_event
+            else 0.0
+        )
+        battery_soc_upper_violation_cost_yuan = (
+            self.battery_violation_penalty_yuan
+            if battery_soc_upper_violation_event
+            else 0.0
+        )
+        battery_violation_event = battery_soc_violation_event
+        battery_violation_cost_yuan = (
+            battery_soc_lower_violation_cost_yuan + battery_soc_upper_violation_cost_yuan
+        )
+
         grid_co2_emission_t = grid_purchase_mwh * self.configs.grid_emission_factor_tco2_per_mwh
         bio_co2_absorption_t = bio["bio_co2_uptake_mol"] * self.configs.co2_molar_mass_g_per_mol / 1e6
         net_co2_emission_t = grid_co2_emission_t - bio_co2_absorption_t
-        carbon_cost = self.carbon_penalty_weight * net_co2_emission_t
-        biomass_reward = self.biomass_reward_weight * max(bio["bio_dX_gDW"], 0.0)
-        harvest_reward = self.harvest_reward_weight * max(bio["bio_harvested_SCP_g_protein"], 0.0)
-        bio_starvation_shortage_mol_h = max(0.0, bio_min_survival_h2_mol_h - bio["bio_h2_load_mol_h"])
-        bio_starvation_cost = self.bio_starvation_penalty_weight * bio_starvation_shortage_mol_h
-        bio_forced_replacement_cost = (
-            self.bio_forced_replacement_penalty_weight
-            * bio["bio_severe_h2_shortfall_replacement_event"]
+        carbon_cost_yuan = max(net_co2_emission_t, 0.0) * self.carbon_price_yuan_per_tco2
+        carbon_credit_yuan = max(-net_co2_emission_t, 0.0) * self.carbon_price_yuan_per_tco2
+
+        scp_growth_revenue_yuan = (
+            max(bio["bio_dSCP_g_protein"], 0.0) / 1000.0 * self.scp_price_yuan_per_kg_protein
         )
-        step_cost = (
-            curtail_mw
-            + weighted_comfort_cost
-            + h2_cost
-            + carbon_cost
-            + bio_starvation_cost
-            + bio_forced_replacement_cost
-            - biomass_reward
-            - harvest_reward
+        scp_harvest_revenue_yuan = (
+            max(bio["bio_harvested_SCP_g_protein"], 0.0) / 1000.0 * self.scp_price_yuan_per_kg_protein
         )
-        reward = -step_cost
+
+        bio_forced_replacement_event = bool(
+            bio["bio_severe_h2_shortfall_replacement_event"]
+        )
+        bio_forced_replacement_cost_yuan = (
+            self.bio_forced_replacement_penalty_yuan
+            if bio_forced_replacement_event
+            else 0.0
+        )
+        bio_starvation_shortage_mol_h = max(
+            0.0, bio_min_survival_h2_mol_h - bio["bio_h2_load_mol_h"]
+        )
+        bio_starvation_cost = 0.0
+        bio_h2_lower_demand_violation_mol_h = max(
+            0.0, bio_min_survival_h2_mol_h - bio["bio_h2_feed_mol_h"]
+        )
+        bio_h2_upper_demand_violation_mol_h = max(
+            0.0, bio["bio_h2_feed_mol_h"] - bio_max_demand_h2_mol_h
+        )
+        bio_h2_lower_demand_violation_event = bool(
+            bio_h2_lower_demand_violation_mol_h > 1e-9
+        )
+        bio_h2_upper_demand_violation_event = bool(
+            bio_h2_upper_demand_violation_mol_h > 1e-9
+        )
+        bio_h2_violation_event = (
+            bio_h2_lower_demand_violation_event
+            or bio_h2_upper_demand_violation_event
+        )
+        bio_h2_lower_demand_violation_cost_yuan = (
+            self.bio_h2_violation_penalty_yuan
+            if bio_h2_lower_demand_violation_event
+            else 0.0
+        )
+        bio_h2_upper_demand_violation_cost_yuan = (
+            self.bio_h2_violation_penalty_yuan
+            if bio_h2_upper_demand_violation_event
+            else 0.0
+        )
+        bio_h2_violation_cost_yuan = (
+            bio_h2_lower_demand_violation_cost_yuan
+            + bio_h2_upper_demand_violation_cost_yuan
+        )
+
+        total_revenue_yuan = (
+            scp_growth_revenue_yuan
+            + scp_harvest_revenue_yuan
+            + carbon_credit_yuan
+        )
+        total_cost_yuan = (
+            curtail_cost_yuan
+            + grid_purchase_cost_yuan
+            + h2_violation_cost_yuan
+            + battery_violation_cost_yuan
+            + comfort_violation_cost_yuan
+            + carbon_cost_yuan
+            + bio_forced_replacement_cost_yuan
+            + bio_h2_violation_cost_yuan
+        )
+        step_profit_yuan = total_revenue_yuan - total_cost_yuan
+        step_cost = total_cost_yuan - total_revenue_yuan
+        reward = step_profit_yuan / max(self.reward_scale_yuan, 1e-12)
+
+        weighted_comfort_cost = comfort_violation_cost_yuan
+        h2_cost = h2_violation_cost_yuan
+        carbon_cost = carbon_cost_yuan
+        biomass_reward = scp_growth_revenue_yuan
+        harvest_reward = scp_harvest_revenue_yuan
+        bio_forced_replacement_cost = bio_forced_replacement_cost_yuan
 
         self.records.append(
             {
@@ -839,11 +985,29 @@ class MicrogridBioDDPGEnv:
                 "p_ez_clipped_mw": p_ez_clipped_mw,
                 **battery,
                 "p_curtail_mw": curtail_mw,
+                "curtail_mwh": curtail_mwh,
+                "curtail_cost_yuan": curtail_cost_yuan,
                 "grid_purchase_mwh": grid_purchase_mwh,
+                "grid_purchase_cost_yuan": grid_purchase_cost_yuan,
+                "battery_soc_lower_violation_event": float(battery_soc_lower_violation_event),
+                "battery_soc_upper_violation_event": float(battery_soc_upper_violation_event),
+                "battery_soc_violation_event": float(battery_soc_violation_event),
+                "battery_soc_lower_violation_cost_yuan": battery_soc_lower_violation_cost_yuan,
+                "battery_soc_upper_violation_cost_yuan": battery_soc_upper_violation_cost_yuan,
+                "battery_violation_event": float(battery_violation_event),
+                "battery_violation_cost_yuan": battery_violation_cost_yuan,
                 "grid_co2_emission_t": grid_co2_emission_t,
                 "bio_co2_absorption_t": bio_co2_absorption_t,
                 "net_co2_emission_t": net_co2_emission_t,
                 "carbon_cost": carbon_cost,
+                "carbon_cost_yuan": carbon_cost_yuan,
+                "carbon_credit_yuan": carbon_credit_yuan,
+                "scp_growth_revenue_yuan": scp_growth_revenue_yuan,
+                "scp_harvest_revenue_yuan": scp_harvest_revenue_yuan,
+                "total_revenue_yuan": total_revenue_yuan,
+                "total_cost_yuan": total_cost_yuan,
+                "step_profit_yuan": step_profit_yuan,
+                "reward_scale_yuan": self.reward_scale_yuan,
                 "h2_tank_mol": self.h2_tank_mol,
                 "building_mw": building_mw,
                 "hvac_mode": hvac_mode,
@@ -853,8 +1017,17 @@ class MicrogridBioDDPGEnv:
                 "p_hvac_electric_kw": p_hvac_electric_kw,
                 "q_hvac": q_hvac,
                 "bio_min_survival_h2_mol_h": bio_min_survival_h2_mol_h,
+                "bio_max_demand_h2_mol_h": bio_max_demand_h2_mol_h,
                 "bio_starvation_shortage_mol_h": bio_starvation_shortage_mol_h,
                 "bio_starvation_cost": bio_starvation_cost,
+                "bio_h2_lower_demand_violation_mol_h": bio_h2_lower_demand_violation_mol_h,
+                "bio_h2_upper_demand_violation_mol_h": bio_h2_upper_demand_violation_mol_h,
+                "bio_h2_lower_demand_violation_event": float(bio_h2_lower_demand_violation_event),
+                "bio_h2_upper_demand_violation_event": float(bio_h2_upper_demand_violation_event),
+                "bio_h2_violation_event": float(bio_h2_violation_event),
+                "bio_h2_lower_demand_violation_cost_yuan": bio_h2_lower_demand_violation_cost_yuan,
+                "bio_h2_upper_demand_violation_cost_yuan": bio_h2_upper_demand_violation_cost_yuan,
+                "bio_h2_violation_cost_yuan": bio_h2_violation_cost_yuan,
                 "bio_forced_replacement_cost": bio_forced_replacement_cost,
                 "ev_h2_out_mol_h": ev_h2_out_mol_h,
                 "h2_after_ev_mol": h2_after_ev_mol,
@@ -871,12 +1044,24 @@ class MicrogridBioDDPGEnv:
                 **bio,
                 "T_room": self.T_in,
                 "T_wall": self.T_wall,
-                "curtail_cost": curtail_mw,
+                "curtail_cost": curtail_cost_yuan,
                 "comfort_violation_C": comfort_violation,
+                "comfort_violation_event": float(comfort_violation_event),
+                "comfort_violation_cost_yuan": comfort_violation_cost_yuan,
                 "comfort_cost_raw": comfort_cost,
                 "comfort_cost_weighted": weighted_comfort_cost,
                 "h2_tank_violation_mol": h2_violation,
+                "h2_lower_violation_mol": h2_lower_violation_mol,
+                "h2_upper_violation_mol": h2_upper_violation_mol,
+                "h2_lower_violation_event": float(h2_lower_violation_event),
+                "h2_upper_violation_event": float(h2_upper_violation_event),
+                "h2_violation_event": float(h2_violation_event),
+                "h2_lower_violation_cost_yuan": h2_lower_violation_cost_yuan,
+                "h2_upper_violation_cost_yuan": h2_upper_violation_cost_yuan,
+                "h2_violation_cost_yuan": h2_violation_cost_yuan,
                 "h2_tank_violation_cost": h2_cost,
+                "bio_forced_replacement_event": float(bio_forced_replacement_event),
+                "bio_forced_replacement_cost_yuan": bio_forced_replacement_cost_yuan,
                 "biomass_reward_component": biomass_reward,
                 "harvest_reward_component": harvest_reward,
                 "step_cost": step_cost,
@@ -1183,19 +1368,51 @@ def save_reward_components_csv(save_dir, split_name, records):
     reward_keys = [
         "hour",
         "reward",
+        "step_profit_yuan",
         "step_cost",
-        "curtail_cost",
+        "total_revenue_yuan",
+        "total_cost_yuan",
+        "curtail_cost_yuan",
+        "grid_purchase_cost_yuan",
+        "h2_violation_event",
+        "h2_lower_violation_event",
+        "h2_upper_violation_event",
+        "h2_lower_violation_cost_yuan",
+        "h2_upper_violation_cost_yuan",
+        "h2_violation_cost_yuan",
+        "battery_violation_event",
+        "battery_soc_lower_violation_event",
+        "battery_soc_upper_violation_event",
+        "battery_soc_violation_event",
+        "battery_soc_lower_violation_cost_yuan",
+        "battery_soc_upper_violation_cost_yuan",
+        "battery_violation_cost_yuan",
         "comfort_violation_C",
-        "comfort_cost_raw",
-        "comfort_cost_weighted",
-        "grid_purchase_kwh",
+        "comfort_violation_event",
+        "comfort_violation_cost_yuan",
         "grid_co2_emission_t",
         "bio_co2_absorption_t",
         "net_co2_emission_t",
-        "carbon_cost",
+        "carbon_cost_yuan",
+        "carbon_credit_yuan",
+        "scp_growth_revenue_yuan",
+        "scp_harvest_revenue_yuan",
+        "bio_forced_replacement_event",
+        "bio_forced_replacement_cost_yuan",
+        "bio_h2_violation_event",
+        "bio_h2_lower_demand_violation_event",
+        "bio_h2_upper_demand_violation_event",
+        "bio_h2_lower_demand_violation_cost_yuan",
+        "bio_h2_upper_demand_violation_cost_yuan",
+        "bio_h2_violation_cost_yuan",
+        "grid_purchase_kwh",
+        "curtail_kwh",
         "h2_tank_violation_mol",
-        "h2_tank_violation_cost",
+        "h2_lower_violation_mol",
+        "h2_upper_violation_mol",
         "bio_starvation_cost",
+        "bio_h2_lower_demand_violation_mol_h",
+        "bio_h2_upper_demand_violation_mol_h",
         "battery_charge_kw",
         "battery_discharge_kw",
         "battery_soc_kwh",
@@ -1205,32 +1422,17 @@ def save_reward_components_csv(save_dir, split_name, records):
     ]
     path = os.path.join(save_dir, f"reward_components_{split_name}.csv")
     with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(reward_keys)
+        writer = csv.DictWriter(f, fieldnames=reward_keys)
+        writer.writeheader()
         for hour, row in enumerate(records):
-            writer.writerow([
-                hour,
-                float(row["reward"]),
-                float(row["step_cost"]),
-                float(row["curtail_cost"]),
-                float(row.get("comfort_violation_C", 0.0)),
-                float(row["comfort_cost_raw"]),
-                float(row["comfort_cost_weighted"]),
-                float(row["grid_purchase_mwh"]) * 1000.0,
-                float(row["grid_co2_emission_t"]),
-                float(row["bio_co2_absorption_t"]),
-                float(row["net_co2_emission_t"]),
-                float(row["carbon_cost"]),
-                float(row["h2_tank_violation_mol"]),
-                float(row["h2_tank_violation_cost"]),
-                float(row["bio_starvation_cost"]),
-                float(row["battery_charge_mw"]) * 1000.0,
-                float(row["battery_discharge_mw"]) * 1000.0,
-                float(row["battery_soc_mwh"]) * 1000.0,
-                float(row["battery_soc_fraction"]),
-                float(row["biomass_reward_component"]),
-                float(row["harvest_reward_component"]),
-            ])
+            out = {key: row.get(key, 0.0) for key in reward_keys}
+            out["hour"] = hour
+            out["grid_purchase_kwh"] = row.get("grid_purchase_mwh", 0.0) * 1000.0
+            out["curtail_kwh"] = row.get("curtail_mwh", row.get("p_curtail_mw", 0.0)) * 1000.0
+            out["battery_charge_kw"] = row.get("battery_charge_mw", 0.0) * 1000.0
+            out["battery_discharge_kw"] = row.get("battery_discharge_mw", 0.0) * 1000.0
+            out["battery_soc_kwh"] = row.get("battery_soc_mwh", 0.0) * 1000.0
+            writer.writerow(out)
     return path
 
 
@@ -1251,6 +1453,38 @@ def save_test_timeseries_details_csv(save_dir, records):
         "p_ez_kw",
         "grid_purchase_kwh",
         "p_curtail_kw",
+        "curtail_cost_yuan",
+        "grid_purchase_cost_yuan",
+        "h2_violation_event",
+        "h2_lower_violation_event",
+        "h2_upper_violation_event",
+        "h2_lower_violation_cost_yuan",
+        "h2_upper_violation_cost_yuan",
+        "h2_violation_cost_yuan",
+        "battery_violation_event",
+        "battery_soc_lower_violation_event",
+        "battery_soc_upper_violation_event",
+        "battery_soc_violation_event",
+        "battery_soc_lower_violation_cost_yuan",
+        "battery_soc_upper_violation_cost_yuan",
+        "battery_violation_cost_yuan",
+        "comfort_violation_event",
+        "comfort_violation_cost_yuan",
+        "carbon_cost_yuan",
+        "carbon_credit_yuan",
+        "scp_growth_revenue_yuan",
+        "scp_harvest_revenue_yuan",
+        "bio_forced_replacement_event",
+        "bio_forced_replacement_cost_yuan",
+        "bio_h2_violation_event",
+        "bio_h2_lower_demand_violation_event",
+        "bio_h2_upper_demand_violation_event",
+        "bio_h2_lower_demand_violation_cost_yuan",
+        "bio_h2_upper_demand_violation_cost_yuan",
+        "bio_h2_violation_cost_yuan",
+        "total_revenue_yuan",
+        "total_cost_yuan",
+        "step_profit_yuan",
         "co2_absorbed_mol",
         "co2_absorbed_t",
         "grid_co2_emission_t",
@@ -1277,6 +1511,8 @@ def save_test_timeseries_details_csv(save_dir, records):
         "battery_soc_fraction",
         "h2_tank_mol",
         "h2_tank_violation_mol",
+        "h2_lower_violation_mol",
+        "h2_upper_violation_mol",
         "ev_h2_out_mol_h",
         "h2_after_ev_mol",
         "bio_available_h2_mol_h",
@@ -1286,8 +1522,11 @@ def save_test_timeseries_details_csv(save_dir, records):
         "bio_h2_load_mol_h",
         "bio_h2_uptake_mol",
         "bio_h2_survival_min_mol_h",
+        "bio_max_demand_h2_mol_h",
         "bio_h2_survival_shortfall_mol_h",
         "bio_h2_biological_absorption_max_mol_h",
+        "bio_h2_lower_demand_violation_mol_h",
+        "bio_h2_upper_demand_violation_mol_h",
         "bio_h2_physical_supply_max_mol_h",
         "reward",
         "step_cost",
@@ -1315,6 +1554,38 @@ def save_test_timeseries_details_csv(save_dir, records):
                 "p_ez_kw": row.get("p_ez_mw", 0.0) * 1000.0,
                 "grid_purchase_kwh": row.get("grid_purchase_mwh", 0.0) * 1000.0,
                 "p_curtail_kw": row.get("p_curtail_mw", 0.0) * 1000.0,
+                "curtail_cost_yuan": row.get("curtail_cost_yuan", 0.0),
+                "grid_purchase_cost_yuan": row.get("grid_purchase_cost_yuan", 0.0),
+                "h2_violation_event": row.get("h2_violation_event", 0.0),
+                "h2_lower_violation_event": row.get("h2_lower_violation_event", 0.0),
+                "h2_upper_violation_event": row.get("h2_upper_violation_event", 0.0),
+                "h2_lower_violation_cost_yuan": row.get("h2_lower_violation_cost_yuan", 0.0),
+                "h2_upper_violation_cost_yuan": row.get("h2_upper_violation_cost_yuan", 0.0),
+                "h2_violation_cost_yuan": row.get("h2_violation_cost_yuan", 0.0),
+                "battery_violation_event": row.get("battery_violation_event", 0.0),
+                "battery_soc_lower_violation_event": row.get("battery_soc_lower_violation_event", 0.0),
+                "battery_soc_upper_violation_event": row.get("battery_soc_upper_violation_event", 0.0),
+                "battery_soc_violation_event": row.get("battery_soc_violation_event", 0.0),
+                "battery_soc_lower_violation_cost_yuan": row.get("battery_soc_lower_violation_cost_yuan", 0.0),
+                "battery_soc_upper_violation_cost_yuan": row.get("battery_soc_upper_violation_cost_yuan", 0.0),
+                "battery_violation_cost_yuan": row.get("battery_violation_cost_yuan", 0.0),
+                "comfort_violation_event": row.get("comfort_violation_event", 0.0),
+                "comfort_violation_cost_yuan": row.get("comfort_violation_cost_yuan", 0.0),
+                "carbon_cost_yuan": row.get("carbon_cost_yuan", 0.0),
+                "carbon_credit_yuan": row.get("carbon_credit_yuan", 0.0),
+                "scp_growth_revenue_yuan": row.get("scp_growth_revenue_yuan", 0.0),
+                "scp_harvest_revenue_yuan": row.get("scp_harvest_revenue_yuan", 0.0),
+                "bio_forced_replacement_event": row.get("bio_forced_replacement_event", 0.0),
+                "bio_forced_replacement_cost_yuan": row.get("bio_forced_replacement_cost_yuan", 0.0),
+                "bio_h2_violation_event": row.get("bio_h2_violation_event", 0.0),
+                "bio_h2_lower_demand_violation_event": row.get("bio_h2_lower_demand_violation_event", 0.0),
+                "bio_h2_upper_demand_violation_event": row.get("bio_h2_upper_demand_violation_event", 0.0),
+                "bio_h2_lower_demand_violation_cost_yuan": row.get("bio_h2_lower_demand_violation_cost_yuan", 0.0),
+                "bio_h2_upper_demand_violation_cost_yuan": row.get("bio_h2_upper_demand_violation_cost_yuan", 0.0),
+                "bio_h2_violation_cost_yuan": row.get("bio_h2_violation_cost_yuan", 0.0),
+                "total_revenue_yuan": row.get("total_revenue_yuan", 0.0),
+                "total_cost_yuan": row.get("total_cost_yuan", 0.0),
+                "step_profit_yuan": row.get("step_profit_yuan", 0.0),
                 "co2_absorbed_mol": row.get("bio_co2_uptake_mol", 0.0),
                 "co2_absorbed_t": row.get("bio_co2_absorption_t", 0.0),
                 "grid_co2_emission_t": row.get("grid_co2_emission_t", 0.0),
@@ -1341,6 +1612,8 @@ def save_test_timeseries_details_csv(save_dir, records):
                 "battery_soc_fraction": row.get("battery_soc_fraction", 0.0),
                 "h2_tank_mol": row.get("h2_tank_mol", 0.0),
                 "h2_tank_violation_mol": row.get("h2_tank_violation_mol", 0.0),
+                "h2_lower_violation_mol": row.get("h2_lower_violation_mol", 0.0),
+                "h2_upper_violation_mol": row.get("h2_upper_violation_mol", 0.0),
                 "ev_h2_out_mol_h": row.get("ev_h2_out_mol_h", 0.0),
                 "h2_after_ev_mol": row.get("h2_after_ev_mol", 0.0),
                 "bio_available_h2_mol_h": row.get("bio_available_h2_mol_h", 0.0),
@@ -1350,8 +1623,11 @@ def save_test_timeseries_details_csv(save_dir, records):
                 "bio_h2_load_mol_h": row.get("bio_h2_load_mol_h", 0.0),
                 "bio_h2_uptake_mol": row.get("bio_h2_uptake_mol", 0.0),
                 "bio_h2_survival_min_mol_h": row.get("bio_h2_survival_min_mol_h", 0.0),
+                "bio_max_demand_h2_mol_h": row.get("bio_max_demand_h2_mol_h", 0.0),
                 "bio_h2_survival_shortfall_mol_h": row.get("bio_h2_survival_shortfall_mol_h", 0.0),
                 "bio_h2_biological_absorption_max_mol_h": row.get("bio_h2_biological_absorption_max_mol_h", 0.0),
+                "bio_h2_lower_demand_violation_mol_h": row.get("bio_h2_lower_demand_violation_mol_h", 0.0),
+                "bio_h2_upper_demand_violation_mol_h": row.get("bio_h2_upper_demand_violation_mol_h", 0.0),
                 "bio_h2_physical_supply_max_mol_h": row.get("bio_h2_physical_supply_max_mol_h", 0.0),
                 "reward": row.get("reward", 0.0),
                 "step_cost": row.get("step_cost", 0.0),
@@ -1361,19 +1637,35 @@ def save_test_timeseries_details_csv(save_dir, records):
 
 EPISODE_REWARD_SUM_SPECS = [
     ("reward", "reward", 1.0),
+    ("step_profit_yuan", "step_profit_yuan", 1.0),
     ("step_cost", "step_cost", 1.0),
-    ("curtail_cost", "curtail_cost", 1.0),
-    ("comfort_cost_weighted", "comfort_cost_weighted", 1.0),
-    ("h2_tank_violation_cost", "h2_tank_violation_cost", 1.0),
-    ("carbon_cost", "carbon_cost", 1.0),
-    ("bio_starvation_cost", "bio_starvation_cost", 1.0),
-    ("biomass_reward_component", "biomass_reward_component", 1.0),
-    ("harvest_reward_component", "harvest_reward_component", 1.0),
+    ("total_revenue_yuan", "total_revenue_yuan", 1.0),
+    ("total_cost_yuan", "total_cost_yuan", 1.0),
+    ("curtail_cost_yuan", "curtail_cost_yuan", 1.0),
+    ("grid_purchase_cost_yuan", "grid_purchase_cost_yuan", 1.0),
+    ("h2_lower_violation_cost_yuan", "h2_lower_violation_cost_yuan", 1.0),
+    ("h2_upper_violation_cost_yuan", "h2_upper_violation_cost_yuan", 1.0),
+    ("h2_violation_cost_yuan", "h2_violation_cost_yuan", 1.0),
+    ("battery_soc_lower_violation_cost_yuan", "battery_soc_lower_violation_cost_yuan", 1.0),
+    ("battery_soc_upper_violation_cost_yuan", "battery_soc_upper_violation_cost_yuan", 1.0),
+    ("battery_violation_cost_yuan", "battery_violation_cost_yuan", 1.0),
+    ("comfort_violation_cost_yuan", "comfort_violation_cost_yuan", 1.0),
+    ("carbon_cost_yuan", "carbon_cost_yuan", 1.0),
+    ("carbon_credit_yuan", "carbon_credit_yuan", 1.0),
+    ("scp_growth_revenue_yuan", "scp_growth_revenue_yuan", 1.0),
+    ("scp_harvest_revenue_yuan", "scp_harvest_revenue_yuan", 1.0),
+    ("bio_forced_replacement_cost_yuan", "bio_forced_replacement_cost_yuan", 1.0),
+    ("bio_h2_lower_demand_violation_cost_yuan", "bio_h2_lower_demand_violation_cost_yuan", 1.0),
+    ("bio_h2_upper_demand_violation_cost_yuan", "bio_h2_upper_demand_violation_cost_yuan", 1.0),
+    ("bio_h2_violation_cost_yuan", "bio_h2_violation_cost_yuan", 1.0),
     ("grid_purchase_kwh", "grid_purchase_mwh", 1000.0),
+    ("curtail_kwh", "curtail_mwh", 1000.0),
     ("grid_co2_emission_t", "grid_co2_emission_t", 1.0),
     ("bio_co2_absorption_t", "bio_co2_absorption_t", 1.0),
     ("net_co2_emission_t", "net_co2_emission_t", 1.0),
     ("h2_tank_violation_mol", "h2_tank_violation_mol", 1.0),
+    ("h2_lower_violation_mol", "h2_lower_violation_mol", 1.0),
+    ("h2_upper_violation_mol", "h2_upper_violation_mol", 1.0),
     ("battery_charge_kw", "battery_charge_mw", 1000.0),
     ("battery_discharge_kw", "battery_discharge_mw", 1000.0),
 ]
@@ -1467,7 +1759,7 @@ def save_split_results(save_dir, split_name, scenario, records, reward, episode_
 
 def run_ddpg_optimization(configs, ddpg_cfg=None, save_dir=None):
     ddpg_cfg = ddpg_cfg or DDPGConfig()
-    save_dir = save_dir or os.path.join(BASE_DIR, "BASDDPG_result")
+    save_dir = save_dir or os.path.join(BASE_DIR, "DDPG_safety")
     os.makedirs(save_dir, exist_ok=True)
     set_seed(ddpg_cfg.seed)
 
@@ -1666,7 +1958,7 @@ def parse_args():
         action="store_true",
         help="Use the full training split for every episode instead of random windows.",
     )
-    parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "BASDDPG_result"))
+    parser.add_argument("--save-dir", type=str, default=os.path.join(BASE_DIR, "DDPG_safety"))
     return parser.parse_args()
 
 
