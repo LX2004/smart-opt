@@ -569,6 +569,11 @@ class MicrogridBioDDPGEnv:
 
         self.dispatch_time_step_h = 1.0
         self.reward_scale_yuan = 1000.0
+        self.reward_event_penalty = 100.0
+        self.reward_bio_forced_replacement_penalty = 100.0
+        self.reward_bio_starvation_scale = 100.0
+        self.reward_bio_growth_scale = 100.0
+        self.reward_ez_smooth_penalty_per_mw = 2.0
         self.curtail_price_yuan_per_kwh = 1.0
         self.grid_price_yuan_per_kwh = 1.0
         self.carbon_price_yuan_per_tco2 = 577.0
@@ -578,7 +583,7 @@ class MicrogridBioDDPGEnv:
         self.comfort_violation_penalty_yuan = 1000.0
         self.bio_forced_replacement_penalty_yuan = 2000.0
         self.bio_h2_violation_penalty_yuan = 1000.0
-        self.battery_capacity_mwh = 2.0
+        self.battery_capacity_mwh = 4.0
         self.battery_power_max_mw = 2.0
         self.battery_efficiency = 0.9
         self.battery_initial_mwh = 0.5 * self.battery_capacity_mwh
@@ -805,7 +810,18 @@ class MicrogridBioDDPGEnv:
             0.0,
             supply_with_battery_mw - electric_load_mw - battery["battery_charge_mw"],
         )
-        p_ez_mw = min(p_ez_command_mw, available_h2_power_mw, self.p_ez_max_mw)
+        ev_h2_out_mol_h = float(self.ev_h2_out_mol_h[idx])
+        h2_after_ev_mol = self.h2_tank_mol - ev_h2_out_mol_h
+        h2_headroom_mol = max(0.0, self.h2_max - h2_after_ev_mol)
+        p_ez_h2_headroom_mw = (
+            h2_headroom_mol * self.h2_electrolyzer_kwh_per_mol / 1000.0
+        )
+        p_ez_mw = min(
+            p_ez_command_mw,
+            available_h2_power_mw,
+            self.p_ez_max_mw,
+            p_ez_h2_headroom_mw,
+        )
         p_ez_clipped_mw = max(0.0, p_ez_command_mw - p_ez_mw)
         demand = electric_load_mw + battery["battery_charge_mw"] + p_ez_mw
         surplus = supply_with_battery_mw - demand
@@ -815,8 +831,6 @@ class MicrogridBioDDPGEnv:
         bio_min_survival_h2_mol_h = self.bio_load.minimum_survival_h2_mol_h()
         bio_max_demand_h2_mol_h = self.bio_load.biological_h2_absorption_max_mol_h()
         h2_in_mol_h = p_ez_mw * 1000.0 / max(self.h2_electrolyzer_kwh_per_mol, 1e-12)
-        ev_h2_out_mol_h = float(self.ev_h2_out_mol_h[idx])
-        h2_after_ev_mol = self.h2_tank_mol - ev_h2_out_mol_h
         bio_available_h2_mol_h = max(0.0, h2_after_ev_mol + h2_in_mol_h - self.h2_min)
         bio_h2_feed_requested_mol_h = bio_h2_feed_mol_h
         bio_h2_limit_info = self.bio_load.resolve_h2_feed_mol_h(
@@ -974,7 +988,73 @@ class MicrogridBioDDPGEnv:
         )
         step_profit_yuan = total_revenue_yuan - total_cost_yuan
         step_cost = total_cost_yuan - total_revenue_yuan
-        reward = step_profit_yuan / max(self.reward_scale_yuan, 1e-12)
+
+        r_economic = -(
+            grid_purchase_cost_yuan
+            + curtail_cost_yuan
+        )
+        r_carbon = carbon_credit_yuan - carbon_cost_yuan
+        r_scp = (
+            scp_growth_revenue_yuan
+            + scp_harvest_revenue_yuan
+        )
+        r_comfort = -10.0 * float(comfort_violation) ** 2
+        r_h2_tank = (
+            -self.reward_event_penalty
+            if h2_violation_event
+            else 0.0
+        )
+        r_battery = (
+            -self.reward_event_penalty
+            if battery_violation_event
+            else 0.0
+        )
+
+        bio_min_h2 = max(float(bio_min_survival_h2_mol_h), 1e-9)
+        bio_current_h2 = float(bio["bio_h2_load_mol_h"])
+        bio_starvation_ratio = max(
+            0.0,
+            (bio_min_h2 - bio_current_h2) / bio_min_h2,
+        )
+        r_bio_starvation = -self.reward_bio_starvation_scale * bio_starvation_ratio
+        bio_h2_upper_constraint_event = bool(
+            bio_current_h2 > float(bio_max_demand_h2_mol_h) + 1e-9
+        )
+        r_bio_h2_upper = (
+            -self.reward_event_penalty
+            if bio_h2_upper_constraint_event
+            else 0.0
+        )
+        r_bio_replacement = (
+            -self.reward_bio_forced_replacement_penalty
+            if bio_forced_replacement_event
+            else 0.0
+        )
+        bio_growth_ratio = max(
+            0.0,
+            (bio_current_h2 - bio_min_h2) / bio_min_h2,
+        )
+        r_bio_growth = self.reward_bio_growth_scale * bio_growth_ratio
+        if len(self.records) > 0:
+            prev_p_ez_mw = float(self.records[-1]["p_ez_mw"])
+        else:
+            prev_p_ez_mw = float(p_ez_mw)
+        ez_power_delta_mw = abs(float(p_ez_mw) - prev_p_ez_mw)
+        r_ez_smooth = -self.reward_ez_smooth_penalty_per_mw * ez_power_delta_mw
+
+        reward = (
+            r_economic
+            + r_carbon
+            + r_scp
+            + r_comfort
+            + r_h2_tank
+            + r_battery
+            + r_bio_starvation
+            + r_bio_h2_upper
+            + r_bio_replacement
+            + r_bio_growth
+            + r_ez_smooth
+        )
 
         weighted_comfort_cost = comfort_violation_cost_yuan
         h2_cost = h2_violation_cost_yuan
@@ -1017,6 +1097,23 @@ class MicrogridBioDDPGEnv:
                 "total_cost_yuan": total_cost_yuan,
                 "step_profit_yuan": step_profit_yuan,
                 "reward_scale_yuan": self.reward_scale_yuan,
+                "r_economic": r_economic,
+                "r_carbon": r_carbon,
+                "r_scp": r_scp,
+                "r_comfort": r_comfort,
+                "r_h2_tank": r_h2_tank,
+                "r_battery": r_battery,
+                "r_bio_starvation": r_bio_starvation,
+                "r_bio_h2_upper": r_bio_h2_upper,
+                "r_bio_replacement": r_bio_replacement,
+                "r_bio_growth": r_bio_growth,
+                "r_ez_smooth": r_ez_smooth,
+                "bio_starvation_ratio": bio_starvation_ratio,
+                "bio_growth_ratio": bio_growth_ratio,
+                "bio_current_h2_mol_h_for_reward": bio_current_h2,
+                "bio_min_h2_mol_h_for_reward": bio_min_h2,
+                "bio_h2_upper_constraint_event_for_reward": float(bio_h2_upper_constraint_event),
+                "ez_power_delta_mw": ez_power_delta_mw,
                 "h2_tank_mol": self.h2_tank_mol,
                 "building_mw": building_mw,
                 "hvac_mode": hvac_mode,
@@ -1242,16 +1339,24 @@ class SafetyProjectionLayer(nn.Module):
             available_after_building_mw + battery_discharge_mw - battery_charge_mw,
             min=0.0,
         )
-        p_ez_mw = self._min_tensor(
-            self._min_tensor(p_ez_command_mw, available_h2_power_mw),
-            self.p_ez_max_mw,
-        )
-
         h2_tank_mol = torch.clamp(state[:, 3:4], 0.0, 1.0) * (
             self.h2_max_mol - self.h2_min_mol
         ) + self.h2_min_mol
-        h2_in_mol_h = p_ez_mw * 1000.0 / max(self.h2_electrolyzer_kwh_per_mol, 1e-12)
         ev_h2_out_mol_h = torch.clamp(state[:, 17:18], min=0.0) * self.ev_h2_out_max_mol_h
+        h2_after_ev_mol = h2_tank_mol - ev_h2_out_mol_h
+        h2_headroom_mol = torch.clamp(self.h2_max_mol - h2_after_ev_mol, min=0.0)
+        p_ez_h2_headroom_mw = (
+            h2_headroom_mol * self.h2_electrolyzer_kwh_per_mol / 1000.0
+        )
+        p_ez_mw = self._min_tensor(
+            self._min_tensor(
+                self._min_tensor(p_ez_command_mw, available_h2_power_mw),
+                self.p_ez_max_mw,
+            ),
+            p_ez_h2_headroom_mw,
+        )
+
+        h2_in_mol_h = p_ez_mw * 1000.0 / max(self.h2_electrolyzer_kwh_per_mol, 1e-12)
         bio_external_available_h2_mol_h = torch.clamp(
             h2_tank_mol - ev_h2_out_mol_h + h2_in_mol_h - self.h2_min_mol,
             min=0.0,
@@ -1447,6 +1552,23 @@ def save_reward_components_csv(save_dir, split_name, records):
         "reward",
         "step_profit_yuan",
         "step_cost",
+        "r_economic",
+        "r_carbon",
+        "r_scp",
+        "r_comfort",
+        "r_h2_tank",
+        "r_battery",
+        "r_bio_starvation",
+        "r_bio_h2_upper",
+        "r_bio_replacement",
+        "r_bio_growth",
+        "r_ez_smooth",
+        "bio_starvation_ratio",
+        "bio_growth_ratio",
+        "bio_current_h2_mol_h_for_reward",
+        "bio_min_h2_mol_h_for_reward",
+        "bio_h2_upper_constraint_event_for_reward",
+        "ez_power_delta_mw",
         "total_revenue_yuan",
         "total_cost_yuan",
         "curtail_cost_yuan",
@@ -1735,6 +1857,20 @@ EPISODE_REWARD_SUM_SPECS = [
     ("bio_h2_lower_demand_violation_cost_yuan", "bio_h2_lower_demand_violation_cost_yuan", 1.0),
     ("bio_h2_upper_demand_violation_cost_yuan", "bio_h2_upper_demand_violation_cost_yuan", 1.0),
     ("bio_h2_violation_cost_yuan", "bio_h2_violation_cost_yuan", 1.0),
+    ("r_economic", "r_economic", 1.0),
+    ("r_carbon", "r_carbon", 1.0),
+    ("r_scp", "r_scp", 1.0),
+    ("r_comfort", "r_comfort", 1.0),
+    ("r_h2_tank", "r_h2_tank", 1.0),
+    ("r_battery", "r_battery", 1.0),
+    ("r_bio_starvation", "r_bio_starvation", 1.0),
+    ("r_bio_h2_upper", "r_bio_h2_upper", 1.0),
+    ("r_bio_replacement", "r_bio_replacement", 1.0),
+    ("r_bio_growth", "r_bio_growth", 1.0),
+    ("r_ez_smooth", "r_ez_smooth", 1.0),
+    ("bio_starvation_ratio", "bio_starvation_ratio", 1.0),
+    ("bio_growth_ratio", "bio_growth_ratio", 1.0),
+    ("ez_power_delta_mw", "ez_power_delta_mw", 1.0),
     ("grid_purchase_kwh", "grid_purchase_mwh", 1000.0),
     ("curtail_kwh", "curtail_mwh", 1000.0),
     ("grid_co2_emission_t", "grid_co2_emission_t", 1.0),
